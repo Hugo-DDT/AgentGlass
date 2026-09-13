@@ -9,7 +9,11 @@ import type {
   ToolInfo,
 } from "@earendil-works/pi-coding-agent";
 import { createEditToolDefinition } from "@earendil-works/pi-coding-agent";
-import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import {
+  truncateToWidth,
+  visibleWidth,
+  wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import {
   consumeApprovalToken,
   executionBinding,
@@ -202,6 +206,118 @@ function wrapLine(line: string, width: number): string[] {
   return line ? wrapTextWithAnsi(line, Math.max(1, width)) : [""];
 }
 
+type PiTheme = ExtensionContext["ui"]["theme"];
+
+type HelpTone = "accent" | "success" | "warning" | "error" | "text";
+
+interface HelpItem {
+  marker: string;
+  text: string;
+  tone: HelpTone;
+}
+
+interface HelpSection {
+  title: string;
+  items: readonly HelpItem[];
+}
+
+const plainPiTheme = {
+  fg: (_color: string, text: string) => text,
+  bg: (_color: string, text: string) => text,
+  bold: (text: string) => text,
+} as PiTheme;
+
+function usablePiTheme(theme: PiTheme | undefined): PiTheme {
+  // 测试/无主题宿主可能提供空的 theme 占位；主题缺失只降级为纯文本，不能让审批失败。
+  try {
+    return theme &&
+      typeof (theme as { fg?: unknown }).fg === "function" &&
+      typeof (theme as { bg?: unknown }).bg === "function" &&
+      typeof (theme as { bold?: unknown }).bold === "function"
+      ? theme
+      : plainPiTheme;
+  } catch {
+    return plainPiTheme;
+  }
+}
+
+function currentPiTheme(ctx: ExtensionContext): PiTheme {
+  try {
+    return usablePiTheme(ctx.ui.theme);
+  } catch {
+    return plainPiTheme;
+  }
+}
+
+function styleWidgetLine(line: string, theme: PiTheme | undefined): string {
+  // 状态行只把已有事实映射为视觉标记；颜色不参与风险判断或审批。
+  const activeTheme = usablePiTheme(theme);
+  if (line.startsWith("已确认：") || line.startsWith("安全示例已准备"))
+    return `${line} ${activeTheme.fg("success", "✓")}`;
+  if (line.startsWith("执行中："))
+    return `${line} ${activeTheme.fg("accent", "…")}`;
+  if (
+    line.startsWith("不符：") ||
+    line.startsWith("无法确认：") ||
+    line.startsWith("已停止：") ||
+    line.includes("未完成")
+  )
+    return `${line} ${activeTheme.fg("warning", "!")}`;
+  if (line.startsWith("✓ ")) return activeTheme.fg("success", line);
+  if (line.startsWith("? ") || line.startsWith("! "))
+    return activeTheme.fg("warning", line);
+  if (line.startsWith("› ") || line.startsWith("↶ ") || line.startsWith("… "))
+    return activeTheme.fg("accent", line);
+  if (line.startsWith("• ")) return activeTheme.fg("muted", line);
+  if (line.startsWith("× ")) return activeTheme.fg("error", line);
+  if (line.startsWith("AgentGlass "))
+    return `${activeTheme.fg("accent", "🛡")} ${activeTheme.bold(line)}`;
+  if (line.startsWith("需要注意：")) return activeTheme.fg("warning", line);
+  return line;
+}
+
+function alignedInfoLine(marker: string, label: string, text: string): string {
+  // 固定可见宽度的标签列，避免中英文混排时依赖冒号对齐；内容只来自已脱敏的本地模板。
+  const prefix = `${marker} ${label}`;
+  const gap = " ".repeat(Math.max(2, 10 - visibleWidth(prefix)));
+  return `${prefix}${gap}${text}`;
+}
+
+function formatOutcomeCardLines(
+  lines: readonly string[],
+  theme: PiTheme | undefined,
+): string[] {
+  const rows = lines.map((line, index) => {
+    // 结论行保持原始开头，便于用户第一眼确认结果，也保留现有安全断言的语义锚点。
+    if (index === 0) return styleWidgetLine(line, theme);
+
+    const known = (prefix: string, marker: string, label: string): string =>
+      alignedInfoLine(marker, label, line.slice(prefix.length).trim());
+
+    if (line.startsWith("执行中：")) return known("执行中：", "…", "处理中");
+    if (line.startsWith("已确认：")) return known("已确认：", "✓", "已核对");
+    if (line.startsWith("还不能确认："))
+      return known("还不能确认：", "?", "尚未确认");
+    if (line.startsWith("已知："))
+      return known("已知：", "✓", index === 1 ? "工具状态" : "文件核对");
+    if (line.startsWith("未确认：")) return known("未确认：", "?", "工具状态");
+    if (line.startsWith("仍未知：")) return known("仍未知：", "?", "仍未知");
+    if (line.startsWith("检查范围："))
+      return known("检查范围：", "•", "核对范围");
+    if (line.startsWith("恢复：")) return known("恢复：", "↶", "恢复");
+    if (line.startsWith("下一步：")) return known("下一步：", "›", "下一步");
+    return styleWidgetLine(line, theme);
+  });
+  return rows;
+}
+
+function styleWidgetLines(
+  lines: readonly string[],
+  theme: PiTheme | undefined,
+): string[] {
+  return lines.map((line) => styleWidgetLine(line, theme));
+}
+
 function samePath(left: string, right: string): boolean {
   const normalizedLeft = path.resolve(left);
   const normalizedRight = path.resolve(right);
@@ -232,7 +348,10 @@ function setWelcomePanel(
   if (ctx.mode !== "tui" || !ctx.hasUI) return;
   try {
     // 欢迎/帮助是同一入口的非审批信息面板；不创建第二套 UI，也不把面板文字送回风险层。
-    ctx.ui.setWidget(WELCOME_WIDGET_KEY, [...lines]);
+    ctx.ui.setWidget(
+      WELCOME_WIDGET_KEY,
+      styleWidgetLines(lines, currentPiTheme(ctx)),
+    );
   } catch {
     // UI 失败只影响说明展示，不改变文件或恢复状态。
   }
@@ -241,11 +360,23 @@ function setWelcomePanel(
 function welcomeLines(cwd: string): readonly string[] {
   return Object.freeze([
     "AgentGlass 已启用",
-    `当前工作文件夹：${safeDirectoryLabel(cwd)}（完整路径不显示）`,
-    "支持：查看、创建或修改当前项目内的普通文本文件。",
-    "变更会先说明预期影响；需要修改时，每一步都要单独取得你的明确同意。",
-    "输入 /agentglass 查看帮助、准备安全示例，或使用最近一次恢复。",
-    "需要已配置模型的 Pi；AgentGlass 不提供安装器、账号或密钥。",
+    alignedInfoLine(
+      "•",
+      "当前项目",
+      `${safeDirectoryLabel(cwd)}（完整路径不显示）`,
+    ),
+    alignedInfoLine("✓", "支持", "查看、创建或修改当前项目内的普通文本文件。"),
+    alignedInfoLine("•", "变更", "先说明预期影响，再逐步取得明确同意。"),
+    alignedInfoLine(
+      "›",
+      "命令",
+      "输入 /agentglass 查看帮助、准备安全示例，或使用最近一次恢复。",
+    ),
+    alignedInfoLine(
+      "!",
+      "前提",
+      "Pi 已配置模型；AgentGlass 不提供安装器、账号或密钥。",
+    ),
   ]);
 }
 
@@ -258,36 +389,304 @@ function projectObservableUserGoal(prompt: string): ObservableUserGoal {
   });
 }
 
-function helpLines(
-  cwd: string,
+function helpSections(
   latestResult: readonly string[] | undefined,
   recovery: SessionRecoveryEntry | undefined,
-): readonly string[] {
-  const lines = [
-    "AgentGlass 帮助",
-    `当前工作文件夹：${safeDirectoryLabel(cwd)}（完整路径不显示）`,
-    "",
-    "支持范围：只处理已验证的普通项目文件查看、创建和修改；只独立核对卡片列出的文件。",
-    "不支持：shell、安装软件、启动或部署项目、联网、批量删除、自定义或覆盖工具。",
-    "审批：停止是默认选择；查看详情不会同意，只有明确选择“继续这次修改”才会执行。",
-    recovery
-      ? `恢复：当前会话可恢复最近一次“${recovery.targetLabel}”；输入 /agentglass restore。`
-      : "恢复：当前没有可用的最近恢复入口。",
-    "清理：只清理已验证归属的 AgentGlass 私有恢复数据；会单独说明数量和能力损失并再次征求同意。",
-    "冲突、损坏、未知或切换会话后不会强行恢复；当前文件会被保留。",
-    "查看文件：请在对话中请求 Pi 查看当前项目内的文件；本入口不会启动 shell 或额外程序。",
-    "切换目录：本入口没有可靠的目录切换能力；请用 Pi 已有方式打开/切换目标项目，确认当前文件夹后再输入 /agentglass。",
-    `安全示例：当前工作文件夹下新建 ${EXAMPLE_RELATIVE_FILE}，不会覆盖已有同名目录或文件。`,
-    `示例目标：${EXAMPLE_GOAL}`,
-    "准备示例目录本身不提供目录恢复；部分失败会保留已创建内容并如实说明，不自动删除。",
-    "上手前提：Pi 需要已经配置模型；空白电脑安装、模型账号和安装器不属于 AgentGlass。",
+): readonly HelpSection[] {
+  const sections: HelpSection[] = [
+    {
+      title: "能力",
+      items: [
+        {
+          marker: "✓",
+          tone: "success",
+          text: "查看、创建和修改已验证的普通项目文本文件；只核对卡片列出的文件。",
+        },
+        {
+          marker: "×",
+          tone: "error",
+          text: "Shell、安装/部署、联网、批量删除、自定义或覆盖工具。",
+        },
+      ],
+    },
+    {
+      title: "安全",
+      items: [
+        {
+          marker: "•",
+          tone: "text",
+          text: "初始选择始终是“停止这一步”；“查看详情”不会同意。",
+        },
+        {
+          marker: "•",
+          tone: "text",
+          text: "只有明确选择“继续这次修改”才会执行。",
+        },
+        {
+          marker: "•",
+          tone: "warning",
+          text: "冲突、损坏、未知或切换会话后会停止；当前文件会被保留。",
+        },
+      ],
+    },
+    {
+      title: "恢复",
+      items: [
+        {
+          marker: "↶",
+          tone: "accent",
+          text: recovery
+            ? `当前会话可恢复最近一次“${recovery.targetLabel}”；输入 /agentglass restore。`
+            : "当前没有可用的最近恢复入口。",
+        },
+        {
+          marker: "•",
+          tone: "text",
+          text: "清理只处理已验证归属的 AgentGlass 私有恢复数据；会单独说明影响并再次征求同意。",
+        },
+      ],
+    },
+    {
+      title: "操作",
+      items: [
+        {
+          marker: "›",
+          tone: "accent",
+          text: "/agentglass example  准备安全示例，不覆盖已有同名目录或文件。",
+        },
+        {
+          marker: "›",
+          tone: "accent",
+          text: "/agentglass restore  恢复最近一次支持的单文件修改。",
+        },
+        {
+          marker: "›",
+          tone: "accent",
+          text: "/agentglass cleanup  清理已验证归属的恢复数据。",
+        },
+        {
+          marker: "•",
+          tone: "text",
+          text: "让 Pi 直接查看当前项目文件；本入口不会启动 shell 或额外程序。",
+        },
+        {
+          marker: "•",
+          tone: "text",
+          text: "切换目录后确认当前项目，再输入 /agentglass。",
+        },
+      ],
+    },
+    {
+      title: "示例与前提",
+      items: [
+        {
+          marker: "•",
+          tone: "text",
+          text: `示例目标 · ${EXAMPLE_GOAL}。示例目录本身不提供目录恢复；部分失败会保留已创建内容并如实说明。`,
+        },
+        {
+          marker: "•",
+          tone: "text",
+          text: "Pi 需要已经配置模型；空白电脑安装、模型账号和安装器不属于 AgentGlass。",
+        },
+      ],
+    },
+    {
+      title: "最近结果",
+      items: latestResult
+        ? formatOutcomeCardLines(latestResult, plainPiTheme).map((text) => ({
+            marker: "",
+            tone: "text" as const,
+            text,
+          }))
+        : [
+            {
+              marker: "•",
+              tone: "text",
+              text: "本次会话还没有 AgentGlass 文件结果。",
+            },
+          ],
+    },
   ];
-  if (latestResult) {
-    lines.push("", "最近结果：", ...latestResult);
-  } else {
-    lines.push("", "最近结果：本次会话还没有 AgentGlass 文件结果。");
-  }
-  return Object.freeze(lines);
+  return Object.freeze(
+    sections.map((section) =>
+      Object.freeze({ ...section, items: Object.freeze([...section.items]) }),
+    ),
+  );
+}
+
+function renderHelpItem(
+  item: HelpItem,
+  width: number,
+  theme: PiTheme,
+): string[] {
+  const prefix = item.marker ? `  ${item.marker} ` : "  ";
+  const prefixWidth = visibleWidth(prefix);
+  const wrapped = wrapTextWithAnsi(item.text, Math.max(1, width - prefixWidth));
+  return wrapped.map((line, index) => {
+    const indent = index === 0 ? prefix : " ".repeat(prefixWidth);
+    return `${indent}${theme.fg(item.tone, line)}`;
+  });
+}
+
+function renderHelpBody(
+  sections: readonly HelpSection[],
+  width: number,
+  theme: PiTheme,
+): string[] {
+  const lines: string[] = [];
+  sections.forEach((section, index) => {
+    if (index > 0) lines.push("");
+    lines.push(theme.bold(theme.fg("accent", section.title)));
+    for (const item of section.items)
+      lines.push(...renderHelpItem(item, width, theme));
+  });
+  return lines;
+}
+
+function compactHelpLines(
+  cwd: string,
+  recovery: SessionRecoveryEntry | undefined,
+): readonly string[] {
+  return Object.freeze([
+    "AgentGlass 帮助",
+    alignedInfoLine("•", "当前项目", safeDirectoryLabel(cwd)),
+    alignedInfoLine("✓", "能力", "查看、创建和修改普通项目文本文件。"),
+    alignedInfoLine(
+      "×",
+      "限制",
+      "Shell、安装/部署、联网、批量删除、自定义工具。",
+    ),
+    alignedInfoLine("!", "安全", "默认停止；查看详情不等于同意。"),
+    recovery
+      ? alignedInfoLine(
+          "↶",
+          "恢复",
+          `可恢复“${recovery.targetLabel}”；输入 /agentglass restore。`,
+        )
+      : alignedInfoLine("↶", "恢复", "当前没有可用的最近恢复入口。"),
+    alignedInfoLine("›", "操作", "/agentglass example / restore / cleanup"),
+    alignedInfoLine("·", "关闭", "Enter 或 Esc。"),
+  ]);
+}
+
+async function showHelpOverlay(
+  ctx: ExtensionContext,
+  cwd: string,
+  sections: readonly HelpSection[],
+): Promise<void> {
+  await ctx.ui.custom<void>(
+    (tui, rawTheme, keybindings, done) => {
+      const theme = usablePiTheme(rawTheme);
+      let scrollOffset = 0;
+      let bodyHeight = 1;
+      let bodyLineCount = 0;
+
+      const requestScroll = (delta: number): void => {
+        const maxOffset = Math.max(0, bodyLineCount - bodyHeight);
+        const next = Math.max(0, Math.min(maxOffset, scrollOffset + delta));
+        if (next === scrollOffset) return;
+        scrollOffset = next;
+        tui.requestRender();
+      };
+
+      const row = (content: string, width: number): string => {
+        const innerWidth = Math.max(1, width - 2);
+        const contentWidth = Math.max(1, innerWidth - 2);
+        const safe = truncateToWidth(content, contentWidth, "");
+        const padded = ` ${safe}${" ".repeat(Math.max(0, contentWidth - visibleWidth(safe)))} `;
+        return `${theme.fg("border", "│")}${theme.bg("customMessageBg", padded)}${theme.fg("border", "│")}`;
+      };
+
+      return {
+        render(width: number): string[] {
+          // 浮层高度与终端同步，固定边框/标题/页脚后把剩余空间交给正文滚动；
+          // 极小终端仍返回可渲染的最小面板，不会把帮助文本写入文件或状态。
+          const terminalRows = Number.isFinite(tui.terminal.rows)
+            ? tui.terminal.rows
+            : 24;
+          const panelHeight = Math.max(
+            1,
+            Math.min(
+              22,
+              Math.floor(terminalRows * 0.88),
+              Math.max(1, terminalRows - 2),
+            ),
+          );
+          bodyHeight = Math.max(1, panelHeight - 7);
+          const panelWidth = Math.max(8, width);
+          const contentWidth = Math.max(1, panelWidth - 4);
+          const body = renderHelpBody(sections, contentWidth, theme);
+          bodyLineCount = body.length;
+          const maxOffset = Math.max(0, bodyLineCount - bodyHeight);
+          scrollOffset = Math.min(scrollOffset, maxOffset);
+          const visible = body.slice(scrollOffset, scrollOffset + bodyHeight);
+          const first = bodyLineCount === 0 ? 0 : scrollOffset + 1;
+          const last = Math.min(bodyLineCount, scrollOffset + visible.length);
+          const footer =
+            panelWidth >= 58
+              ? `↑↓ 滚动 · PgUp/PgDn 翻页 · Enter/Esc 关闭   ${first}–${last} / ${bodyLineCount}`
+              : `↑↓/PgUp/PgDn 滚动 · Esc 关闭   ${first}–${last}/${bodyLineCount}`;
+          const horizontal = (left: string, right: string): string =>
+            theme.fg(
+              "border",
+              `${left}${"─".repeat(Math.max(1, panelWidth - 2))}${right}`,
+            );
+
+          return [
+            horizontal("╭", "╮"),
+            row(
+              theme.bold(theme.fg("accent", "🛡 AgentGlass 帮助")),
+              panelWidth,
+            ),
+            row(
+              theme.fg("muted", `当前项目 · ${safeDirectoryLabel(cwd)}`),
+              panelWidth,
+            ),
+            horizontal("├", "┤"),
+            ...visible.map((line) => row(line, panelWidth)),
+            horizontal("├", "┤"),
+            row(theme.fg("muted", footer), panelWidth),
+            horizontal("╰", "╯"),
+          ];
+        },
+        invalidate(): void {},
+        handleInput(data: string): void {
+          if (
+            keybindings.matches(data, "tui.select.cancel") ||
+            keybindings.matches(data, "tui.select.confirm")
+          ) {
+            done();
+            return;
+          }
+          if (keybindings.matches(data, "tui.select.up")) {
+            requestScroll(-1);
+            return;
+          }
+          if (keybindings.matches(data, "tui.select.down")) {
+            requestScroll(1);
+            return;
+          }
+          if (keybindings.matches(data, "tui.select.pageUp")) {
+            requestScroll(-Math.max(1, bodyHeight - 1));
+            return;
+          }
+          if (keybindings.matches(data, "tui.select.pageDown"))
+            requestScroll(Math.max(1, bodyHeight - 1));
+        },
+        dispose(): void {},
+      };
+    },
+    {
+      overlay: true,
+      overlayOptions: {
+        anchor: "center",
+        width: 92,
+        maxHeight: "88%",
+        margin: 1,
+      },
+    },
+  );
 }
 
 async function inspectExamplePlan(
@@ -404,17 +803,27 @@ async function requestOutcomeApproval(
 
         return {
           render(width: number): string[] {
+            const theme = usablePiTheme(_theme);
+            const button = (label: string, index: number): string => {
+              const marker = selected === index ? theme.fg("accent", "›") : " ";
+              const text = `${marker} ${selected === index ? theme.bold(`[当前] ${label}`) : `[ ] ${label}`}`;
+              return selected === index
+                ? theme.bg("selectedBg", text)
+                : theme.fg("muted", text);
+            };
+            const buttons = labels.map(button);
             const content = [
-              card.title,
-              card.expectedOutcome,
-              card.attention,
-              card.recovery,
+              theme.fg(
+                card.title.startsWith("已停止") ? "error" : "accent",
+                theme.bold(`🛡 ${card.title}`),
+              ),
+              theme.fg("text", `› ${card.expectedOutcome}`),
+              theme.fg("warning", `! ${card.attention}`),
+              theme.fg("accent", `↶ ${card.recovery}`),
               ...(expanded ? ["详情：", ...card.details] : []),
               "",
-              ...labels.map(
-                (label, index) =>
-                  `${selected === index ? "[当前]" : "[ ]"} ${label}`,
-              ),
+              // 操作始终逐行显示，避免横向排列时把“继续”误读成默认动作。
+              ...buttons,
               "方向键选择，Enter 确认，Esc 停止。查看详情不会批准修改。",
             ];
             return content.flatMap((line) => wrapLine(line, width));
@@ -624,7 +1033,10 @@ function setActionCard(
   if (ctx.mode !== "tui" || !ctx.hasUI) return;
   try {
     // modal 在 Continue 后由 Pi 关闭；稳定 key 让同一逻辑动作卡在原位置区域进入执行/结果态。
-    ctx.ui.setWidget(ACTION_CARD_KEY, [...update.lines]);
+    ctx.ui.setWidget(
+      ACTION_CARD_KEY,
+      formatOutcomeCardLines(update.lines, currentPiTheme(ctx)),
+    );
   } catch {
     // 展示失败不能改写已经完成的文件事实，也不能泄漏宿主异常文本。
   }
@@ -1022,7 +1434,15 @@ export function registerPiAdapter(
         recovery = undefined;
       }
     }
-    setWelcomePanel(ctx, helpLines(ctx.cwd, latestResult, recovery));
+    const sections = helpSections(latestResult, recovery);
+    try {
+      await showHelpOverlay(ctx, ctx.cwd, sections);
+      // 帮助是临时查看，不覆盖常驻欢迎面板；关闭后恢复原来的项目提示。
+      setWelcomePanel(ctx, welcomeLines(ctx.cwd));
+    } catch {
+      setWelcomePanel(ctx, compactHelpLines(ctx.cwd, recovery));
+      notify(ctx, "帮助浮层无法打开，已显示精简帮助。", "warning");
+    }
   };
 
   const prepareExample = async (ctx: ExtensionContext): Promise<void> => {
@@ -1247,21 +1667,22 @@ export function registerPiAdapter(
       }
       let action = args.trim().toLowerCase();
       if (!action) {
-        const choice = await ctx.ui.select("AgentGlass", [
-          "查看欢迎与帮助",
-          "准备安全示例",
-          ...(menuHasRecovery ? ["恢复最近一次修改"] : []),
-          "清理本地恢复数据",
+        const menuOptions = [
+          "› 查看欢迎与帮助",
+          "✦ 准备安全示例",
+          ...(menuHasRecovery ? ["↶ 恢复最近一次修改"] : []),
+          "× 清理本地恢复数据",
           "关闭",
-        ]);
+        ];
+        const choice = await ctx.ui.select("🛡 AgentGlass", menuOptions);
         action =
-          choice === "查看欢迎与帮助"
+          choice === menuOptions[0]
             ? "help"
-            : choice === "准备安全示例"
+            : choice === menuOptions[1]
               ? "example"
-              : choice === "恢复最近一次修改"
+              : menuHasRecovery && choice === menuOptions[2]
                 ? "restore"
-                : choice === "清理本地恢复数据"
+                : choice === menuOptions[menuOptions.length - 2]
                   ? "cleanup"
                   : "";
       }

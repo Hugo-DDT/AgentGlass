@@ -160,7 +160,10 @@ interface TestComponent {
 }
 
 type TestCustomFactory<T> = (
-  tui: { requestRender(): void },
+  tui: {
+    requestRender(): void;
+    terminal: { rows: number; columns: number };
+  },
   theme: unknown,
   keybindings: { matches(data: string, key: string): boolean },
   done: (value: T) => void,
@@ -190,7 +193,10 @@ function installApprovalUi(
       resolveResult = resolve;
     });
     const component = await factory(
-      { requestRender: () => {} },
+      {
+        requestRender: () => {},
+        terminal: { rows: 24, columns: 80 },
+      },
       base.theme,
       {
         matches: (data: string, key: string) =>
@@ -200,6 +206,8 @@ function installApprovalUi(
               "tui.select.cancel": "esc",
               "tui.select.up": "up",
               "tui.select.down": "down",
+              "tui.select.pageUp": "pageup",
+              "tui.select.pageDown": "pagedown",
               "tui.input.tab": "tab",
               "tui.select.confirm": "enter",
             } as Record<string, string>
@@ -351,6 +359,7 @@ test("B-002 keeps one recovery across agent_end, restores through /agentglass, a
   const ui = installApprovalUi(runtime, [
     { inputs: ["down", "down", "enter"] },
     { inputs: ["enter"] },
+    { inputs: ["enter"] },
     { inputs: ["down", "down", "enter"] },
   ]);
   const targetPath = join(runtime.cwd, "recover.txt");
@@ -371,11 +380,11 @@ test("B-002 keeps one recovery across agent_end, restores through /agentglass, a
     details: undefined,
     isError: false,
   });
+  const helpRenderStart = ui.rendered.length;
   await runtime.session.prompt("/agentglass help");
-  expect(ui.widgets.at(-1)?.content?.join("\n")).toContain(
-    "当前会话可恢复最近一次",
-  );
-  expect(ui.widgets.at(-1)?.content?.join("\n")).toContain("/agentglass");
+  const helpOutput = ui.rendered.slice(helpRenderStart).flat().join("\n");
+  expect(helpOutput).toContain("当前会话可恢复最近一次");
+  expect(helpOutput).toContain("/agentglass restore");
   await runtime.session.extensionRunner.emit({
     type: "tool_execution_end",
     toolCallId: call.id,
@@ -402,10 +411,10 @@ test("B-002 keeps one recovery across agent_end, restores through /agentglass, a
   await runtime.session.prompt("/agentglass restore");
   expect(await readFile(targetPath, "utf8")).toBe("before");
   expect(ui.widgets.at(-1)?.content?.join("\n")).toContain("已恢复");
-  expect(ui.customCalls).toBe(3);
+  expect(ui.customCalls).toBe(4);
 
   await runtime.session.prompt("/agentglass restore");
-  expect(ui.customCalls).toBe(3);
+  expect(ui.customCalls).toBe(4);
   expect(ui.notifications.at(-1)?.message).toContain("没有可用");
 });
 
@@ -1110,6 +1119,13 @@ test("Pi 0.85.1 TUI Continue is single-shot, Explain is not approval, Stop/Esc f
   expect(continueUi.rendered[0]?.every((line) => [...line].length <= 18)).toBe(
     true,
   );
+  const wideActionLines = (continueUi.rendered[1] ?? []).filter(
+    (line) => line.includes("[当前]") || line.includes("[ ]"),
+  );
+  expect(wideActionLines).toHaveLength(3);
+  expect(wideActionLines[0]).toContain("[当前] 停止这一步");
+  expect(wideActionLines[1]).toContain("[ ] 查看详情");
+  expect(wideActionLines[2]).toContain("[ ] 继续这次修改");
 
   const explainRuntime = await createRuntime();
   const explainUi = installApprovalUi(explainRuntime, [
@@ -1514,7 +1530,14 @@ test("B-001 correlates one result to one card and rejects duplicate, wrong-order
   };
   await runner.emitToolResult(resultEvent);
   const afterFirst = ui.widgets.length;
-  expect(ui.widgets.at(-1)?.content?.[0]).toContain("已确认：matched.txt");
+  const matchedCard = ui.widgets.at(-1)?.content ?? [];
+  expect(matchedCard[0]).toContain("已确认：matched.txt");
+  expect(matchedCard[1]).toContain("✓ 工具状态");
+  expect(matchedCard[2]).toContain("✓ 文件核对");
+  expect(matchedCard[3]).toContain("? 仍未知");
+  expect(matchedCard[4]).toContain("• 核对范围");
+  expect(matchedCard[5]).toContain("↶ 恢复");
+  expect(matchedCard[6]).toContain("› 下一步");
   await runner.emitToolResult(resultEvent);
   expect(ui.widgets).toHaveLength(afterFirst);
   expect(JSON.stringify(ui.widgets)).not.toContain("untrusted result");
@@ -1655,41 +1678,56 @@ test("B-003 reuses /agentglass for help, the fixed example, conflicts, and cance
     captureStartup: true,
   });
   expect(runtime.startupWidgets).toHaveLength(1);
-  expect(runtime.startupWidgets[0]?.join("\n")).toContain("AgentGlass 已启用");
+  const startup = runtime.startupWidgets[0]?.join("\n") ?? "";
+  expect(startup).toContain("AgentGlass 已启用");
+  expect(startup).toContain("• 当前项目");
+  expect(startup).toContain("✓ 支持");
+  expect(startup).toContain("› 命令");
+  expect(startup).not.toContain("当前项目：");
   await runtime.session.extensionRunner.emit({
     type: "session_start",
     reason: "reload",
   });
   expect(runtime.startupWidgets).toHaveLength(1);
   const ui = installApprovalUi(runtime, [
+    { inputs: ["pagedown", "pagedown", "pagedown", "pagedown", "esc"] },
     { inputs: ["down", "down", "enter"] },
+    { inputs: ["pagedown", "pagedown", "pagedown", "pagedown", "esc"] },
     { inputs: ["enter"] },
   ]);
 
+  const firstHelpRender = ui.rendered.length;
   await runtime.session.prompt("/agentglass help");
-  const help = ui.widgets.at(-1)?.content?.join("\n") ?? "";
-  expect(help).toContain("支持范围");
-  expect(help).toContain("查看文件");
-  expect(help).toContain("切换目录");
-  expect(help).toContain(
-    "安全示例：当前工作文件夹下新建 agentglass-example/活动说明.txt",
-  );
-  expect(help).not.toContain(runtime.cwd);
-  expect(ui.customCalls).toBe(0);
+  const helpRenders = ui.rendered.slice(firstHelpRender);
+  expect(helpRenders[0]?.length ?? 0).toBeGreaterThan(18);
+  expect(helpRenders[0]?.some((line) => line.includes("能力"))).toBe(true);
+  expect(
+    helpRenders.some((lines) => lines.some((line) => line.includes("操作"))),
+  ).toBe(true);
+  expect(
+    helpRenders.some((lines) =>
+      lines.some((line) => line.includes("最近结果")),
+    ),
+  ).toBe(true);
+  expect(helpRenders.flat().join("\n")).not.toContain(runtime.cwd);
+  expect(ui.customCalls).toBe(1);
 
   await runtime.session.prompt("/agentglass example");
   const examplePath = join(runtime.cwd, "agentglass-example", "活动说明.txt");
   expect(await readFile(examplePath, "utf8")).toBe(
     "活动说明\n\n活动名称：社区旧物交换日\n时间：周六 10:00—15:00\n地点：社区活动室\n安排：带来闲置物品，现场登记后交换。\n报名：现场登记。\n",
   );
-  expect(ui.customCalls).toBe(1);
+  expect(ui.customCalls).toBe(2);
 
+  const secondHelpRender = ui.rendered.length;
   await runtime.session.prompt("/agentglass help");
-  expect(ui.widgets.at(-1)?.content?.join("\n")).toContain("最近结果");
-  expect(ui.widgets.at(-1)?.content?.join("\n")).toContain("安全示例已准备");
+  const secondHelpRenders = ui.rendered.slice(secondHelpRender);
+  expect(secondHelpRenders.flat().join("\n")).toContain("最近结果");
+  expect(secondHelpRenders.flat().join("\n")).toContain("安全示例已准备");
+  expect(ui.customCalls).toBe(3);
 
   await runtime.session.prompt("/agentglass example");
-  expect(ui.customCalls).toBe(1);
+  expect(ui.customCalls).toBe(3);
   expect(ui.notifications.at(-1)?.message).toContain("不会覆盖已有目录或文件");
 
   await rm(join(runtime.cwd, "agentglass-example"), {
@@ -1697,7 +1735,7 @@ test("B-003 reuses /agentglass for help, the fixed example, conflicts, and cance
     force: true,
   });
   await runtime.session.prompt("/agentglass example");
-  expect(ui.customCalls).toBe(2);
+  expect(ui.customCalls).toBe(4);
   expect(ui.notifications.at(-1)?.message).toContain("没有创建目录或文件");
   expect(
     await readFile(
@@ -1716,4 +1754,16 @@ test("B-003 blocks example preparation without interactive UI", async () => {
       "utf8",
     ).catch(() => undefined),
   ).toBeUndefined();
+});
+
+test("B-003 help falls back to a compact widget when the floating view fails", async () => {
+  const runtime = await createRuntime({ bindUI: true });
+  const ui = installApprovalUi(runtime, [{ error: true }]);
+
+  await runtime.session.prompt("/agentglass help");
+
+  const fallback = ui.widgets.at(-1)?.content?.join("\n") ?? "";
+  expect(fallback).toContain("✓ 能力");
+  expect(fallback).toContain("× 限制");
+  expect(ui.notifications.at(-1)?.message).toContain("帮助浮层无法打开");
 });
