@@ -30,13 +30,9 @@ import type {
   PreImageSnapshotEvidence,
   RiskAssessment,
   SiblingExecutionReference,
+  SnapshotFailureCode,
   TransientHostExecutionInput,
 } from "../../core/domain.js";
-import {
-  projectHostExecutionInput,
-  projectObservableUserGoal,
-} from "../../core/execution-input.js";
-import { resolveSensitiveSnapshotTarget } from "../../core/file-classification.js";
 import {
   FILE_OBSERVATION_LIMIT_BYTES,
   hashFileBytes,
@@ -45,6 +41,7 @@ import {
 } from "../../core/file-verification.js";
 import {
   fingerprintTransientActionInput,
+  projectTransientActionInput,
   redactDisplayString,
 } from "../../core/input-boundary.js";
 import {
@@ -52,18 +49,7 @@ import {
   renderOutcomeCardUpdate,
   renderReadNotice,
 } from "../../core/outcome-card.js";
-import {
-  capturePreImageSnapshot,
-  cleanSnapshotSet,
-  finalizeRecoverySnapshot,
-  inspectCleanupSet,
-  markRecoveryState,
-  type RecoveryEntry,
-  recoveryEntryIsCurrent,
-  restoreRecoveryEntry,
-  unavailablePreImageSnapshot,
-  verifyPreImageSnapshotBaseline,
-} from "../../core/pre-image-snapshot.js";
+import type { RecoveryEntry } from "../../core/pre-image-snapshot.js";
 import { predictEffects } from "../../core/predicted-effects.js";
 import {
   assessSiblingMutationRisk,
@@ -72,6 +58,66 @@ import {
 import { readStableFile } from "../../core/stable-file.js";
 
 type AdapterObserver = (facts: HostExecutionFacts) => Promise<void> | void;
+type SnapshotModule = typeof import("../../core/pre-image-snapshot.js");
+type ExecutionInputModule = typeof import("../../core/execution-input.js");
+type FileClassificationModule =
+  typeof import("../../core/file-classification.js");
+
+// 快照实现包含文件持久化、ACL 子进程和恢复逻辑；监听器仍同步注册，只有实际需要时才加载。
+// 使用原生 ESM 缓存，不维护第二套全局生命周期或后台预加载状态。
+const loadSnapshotModule = async (): Promise<SnapshotModule | undefined> => {
+  try {
+    return await import("../../core/pre-image-snapshot.js");
+  } catch {
+    return undefined;
+  }
+};
+
+// 文件分类依赖较大的路径检查模块；只在第一笔工具调用进入预检时加载，
+// 但 Pi 事件监听仍在本函数内同步完成注册。加载失败由调用方统一失败关闭。
+const loadExecutionInputModule = async (): Promise<
+  ExecutionInputModule | undefined
+> => {
+  try {
+    return await import("../../core/execution-input.js");
+  } catch {
+    return undefined;
+  }
+};
+
+type SnapshotTargetOptions = Parameters<
+  FileClassificationModule["resolveSensitiveSnapshotTarget"]
+>[0];
+type SnapshotTarget = Awaited<
+  ReturnType<FileClassificationModule["resolveSensitiveSnapshotTarget"]>
+>;
+
+async function resolveSensitiveSnapshotTarget(
+  options: SnapshotTargetOptions,
+): Promise<SnapshotTarget> {
+  const module = await import("../../core/file-classification.js").catch(
+    () => undefined,
+  );
+  return module
+    ? await module.resolveSensitiveSnapshotTarget(options)
+    : undefined;
+}
+
+// 快照模块加载失败时仍返回固定、脱敏的失败证据；调用方据此阻止变更，不回显异常文本。
+function unavailablePreImageSnapshot(
+  failureCode: SnapshotFailureCode,
+  targetExisted: PreImageSnapshotEvidence["targetExisted"] = "unknown",
+): PreImageSnapshotEvidence {
+  return Object.freeze({
+    status: "unavailable",
+    snapshotId: null,
+    targetExisted,
+    permissionMetadata: "unknown",
+    failureCode,
+    canRestoreNow: false,
+    recoveryGrade: "unknown",
+  });
+}
 
 const BLOCK_REASON =
   "AgentGlass could not verify this tool call's runtime identity, so it was stopped.";
@@ -89,6 +135,8 @@ const SAFETY_BLOCK_REASON =
   "已停止：当前版本无法可靠说明或支持这一步。请改为普通项目文件的查看或单个修改。";
 const BACKUP_BLOCK_REASON =
   "已停止：未能取得这次修改所需的修改前证据，或这一步会创建缺少的上级文件夹。请明确选择已有文件夹中的一份普通文件后重试。";
+const SNAPSHOT_MODULE_UNAVAILABLE_REASON =
+  "已停止：当前恢复数据模块不可用，未执行恢复或清理。请稍后在同一会话重试。";
 const READ_STATUS_KEY = "agentglass-read";
 const ACTION_CARD_KEY = "agentglass-action";
 const WELCOME_WIDGET_KEY = "agentglass-welcome";
@@ -199,6 +247,15 @@ function welcomeLines(cwd: string): readonly string[] {
     "输入 /agentglass 查看帮助、准备安全示例，或使用最近一次恢复。",
     "需要已配置模型的 Pi；AgentGlass 不提供安装器、账号或密钥。",
   ]);
+}
+
+function projectObservableUserGoal(prompt: string): ObservableUserGoal {
+  // 目标原文只在事件到达时投影；原文不进入持久状态或风险判断。
+  return Object.freeze({
+    status: "observed",
+    redactedText: projectTransientActionInput("observable-user-goal", prompt)
+      .redactedInput,
+  });
 }
 
 function helpLines(
@@ -775,7 +832,11 @@ async function assessMappedBatch(
   batch: readonly TransientHostExecutionInput[],
   toolCallId: string,
 ): Promise<{ facts: HostExecutionFacts; risk: RiskAssessment }> {
-  const facts = await Promise.all(batch.map(projectHostExecutionInput));
+  const executionInput = await loadExecutionInputModule();
+  if (!executionInput) throw new Error();
+  const facts = await Promise.all(
+    batch.map(executionInput.projectHostExecutionInput),
+  );
   const current = facts.find((item) => item.toolCallId === toolCallId);
   if (!current) throw new Error();
   return {
@@ -869,9 +930,12 @@ export function registerPiAdapter(
   ) => {
     try {
       const target = await resolveCurrentSnapshot(event, ctx, expectedAction);
-      return target
-        ? await capturePreImageSnapshot(snapshotRoot, target)
-        : unavailablePreImageSnapshot("SNAPSHOT_TARGET_UNSUPPORTED");
+      if (!target)
+        return unavailablePreImageSnapshot("SNAPSHOT_TARGET_UNSUPPORTED");
+      const snapshots = await loadSnapshotModule();
+      if (!snapshots)
+        return unavailablePreImageSnapshot("SNAPSHOT_STORAGE_UNAVAILABLE");
+      return await snapshots.capturePreImageSnapshot(snapshotRoot, target);
     } catch {
       return unavailablePreImageSnapshot("SNAPSHOT_TARGET_CHANGED");
     }
@@ -885,13 +949,15 @@ export function registerPiAdapter(
     if (facts.preImage.status !== "saved") return true;
     try {
       const target = await resolveCurrentSnapshot(event, ctx, facts.action);
+      if (!target) return false;
+      const snapshots = await loadSnapshotModule();
+      if (!snapshots) return false;
       return Boolean(
-        target &&
-          (await verifyPreImageSnapshotBaseline(
-            snapshotRoot,
-            facts.preImage,
-            target,
-          )),
+        await snapshots.verifyPreImageSnapshotBaseline(
+          snapshotRoot,
+          facts.preImage,
+          target,
+        ),
       );
     } catch {
       return false;
@@ -944,7 +1010,11 @@ export function registerPiAdapter(
     let recovery = latestRecovery;
     if (recovery) {
       try {
-        if (!(await recoveryEntryIsCurrent(snapshotRoot, recovery))) {
+        const snapshots = await loadSnapshotModule();
+        if (
+          !snapshots ||
+          !(await snapshots.recoveryEntryIsCurrent(snapshotRoot, recovery))
+        ) {
           if (latestRecovery === recovery) latestRecovery = undefined;
           recovery = undefined;
         }
@@ -1163,9 +1233,13 @@ export function registerPiAdapter(
       let menuHasRecovery = Boolean(latestRecovery);
       if (latestRecovery) {
         try {
-          menuHasRecovery = await recoveryEntryIsCurrent(
-            snapshotRoot,
-            latestRecovery,
+          const snapshots = await loadSnapshotModule();
+          menuHasRecovery = Boolean(
+            snapshots &&
+              (await snapshots.recoveryEntryIsCurrent(
+                snapshotRoot,
+                latestRecovery,
+              )),
           );
         } catch {
           menuHasRecovery = false;
@@ -1211,11 +1285,13 @@ export function registerPiAdapter(
       }
       if (action === "restore" || action === "恢复") {
         const entry = latestRecovery;
+        const snapshots = entry ? await loadSnapshotModule() : undefined;
         if (
           !entry ||
           entry.sessionId !== commandSession ||
           entry.cwd !== ctx.cwd ||
-          !(await recoveryEntryIsCurrent(snapshotRoot, entry))
+          !snapshots ||
+          !(await snapshots.recoveryEntryIsCurrent(snapshotRoot, entry))
         ) {
           if (entry && latestRecovery === entry) latestRecovery = undefined;
           notify(
@@ -1269,7 +1345,8 @@ export function registerPiAdapter(
         }
         if (
           latestRecovery !== entry ||
-          !(await recoveryEntryIsCurrent(snapshotRoot, entry))
+          !snapshots ||
+          !(await snapshots.recoveryEntryIsCurrent(snapshotRoot, entry))
         ) {
           if (latestRecovery === entry) latestRecovery = undefined;
           invalidateApprovalToken(token);
@@ -1290,7 +1367,10 @@ export function registerPiAdapter(
         }
         pendingTokens.delete(token);
         latestRecovery = undefined;
-        const result = await restoreRecoveryEntry(snapshotRoot, entry);
+        const result = await snapshots.restoreRecoveryEntry(
+          snapshotRoot,
+          entry,
+        );
         const resultLines = Object.freeze([
           result.status === "restored"
             ? `已确认：${entry.targetLabel} 已恢复到这次修改之前。`
@@ -1316,7 +1396,12 @@ export function registerPiAdapter(
       }
 
       if (action === "cleanup" || action === "清理") {
-        const cleanup = await inspectCleanupSet(snapshotRoot);
+        const snapshots = await loadSnapshotModule();
+        if (!snapshots) {
+          notify(ctx, SNAPSHOT_MODULE_UNAVAILABLE_REASON, "warning");
+          return;
+        }
+        const cleanup = await snapshots.inspectCleanupSet(snapshotRoot);
         if (cleanup.fileCount === 0) {
           notify(ctx, "没有可验证归属且可清理的 AgentGlass 恢复数据。");
           return;
@@ -1350,7 +1435,7 @@ export function registerPiAdapter(
           notify(ctx, "已停止：未批准清理，本地数据未删除。");
           return;
         }
-        const current = await inspectCleanupSet(snapshotRoot);
+        const current = await snapshots.inspectCleanupSet(snapshotRoot);
         const finalBinding = internalBinding(
           "agentglass.cleanup",
           ctx,
@@ -1375,7 +1460,7 @@ export function registerPiAdapter(
           return;
         }
         pendingTokens.delete(token);
-        const result = await cleanSnapshotSet(snapshotRoot, cleanup);
+        const result = await snapshots.cleanSnapshotSet(snapshotRoot, cleanup);
         const activeSnapshotId = latestRecovery?.snapshotId;
         if (
           activeSnapshotId &&
@@ -1738,18 +1823,25 @@ export function registerPiAdapter(
       report.status === "matched" &&
       pending.expected.kind === "exact_bytes"
     ) {
-      const ready = await finalizeRecoverySnapshot(
-        snapshotRoot,
-        pending.preImage,
-        pending.effect.effectId,
-        pending.expected.expectedSha256,
-        pending.expected.expectedByteLength,
-      );
-      if (ready && runGeneration === generation) {
+      const snapshots = await loadSnapshotModule();
+      const ready = snapshots
+        ? await snapshots.finalizeRecoverySnapshot(
+            snapshotRoot,
+            pending.preImage,
+            pending.effect.effectId,
+            pending.expected.expectedSha256,
+            pending.expected.expectedByteLength,
+          )
+        : undefined;
+      if (ready && snapshots && runGeneration === generation) {
         const previous = latestRecovery;
         const replacementRecorded =
           !previous ||
-          (await markRecoveryState(snapshotRoot, previous, "superseded"));
+          (await snapshots.markRecoveryState(
+            snapshotRoot,
+            previous,
+            "superseded",
+          ));
         if (replacementRecorded) {
           latestRecovery = Object.freeze({
             ...ready,

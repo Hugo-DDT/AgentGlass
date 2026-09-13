@@ -1,11 +1,24 @@
 import type {
   HostExecutionFacts,
   ObservableUserGoal,
+  PreImageSnapshotEvidence,
   TransientHostExecutionInput,
 } from "./domain.js";
 import { classifyFileAction } from "./file-classification.js";
 import { projectTransientActionInput } from "./input-boundary.js";
-import { noPreImageSnapshot } from "./pre-image-snapshot.js";
+
+// 普通 read 的预检只需要这个固定的未知证据；在此处创建可避免启动时加载快照持久化和 ACL 实现。
+function noPreImageSnapshot(): PreImageSnapshotEvidence {
+  return Object.freeze({
+    status: "not_applicable",
+    snapshotId: null,
+    targetExisted: "unknown",
+    permissionMetadata: "unknown",
+    failureCode: null,
+    canRestoreNow: false,
+    recoveryGrade: "unknown",
+  });
+}
 
 export function projectObservableUserGoal(prompt: string): ObservableUserGoal {
   // 目标原文不参与后续安全判断，因此在 Pi 生命周期事件到达时立即脱敏，不能跨事件保存原文。

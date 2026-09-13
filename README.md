@@ -1,12 +1,12 @@
 # AgentGlass
 
-[简体中文](./README.zh-CN.md)
+[English](./README.md) · [简体中文](./README.zh-CN.md)
 
 **A beginner-first file approval extension for the [Pi Agent](https://github.com/earendil-works/pi).**
 
 AgentGlass is for beginners who are not familiar with shell commands, Git diffs, or file risks. It explains the file result Pi is about to produce in plain language, so the user can confirm it before the file actually changes.
 
-> **0.8.0 candidate · Windows only · Not published**
+> **0.8.0 · Windows only**
 
 ## Why AgentGlass?
 
@@ -38,26 +38,41 @@ Ordinary reads do not require an approval card after the required safety checks 
 
 ## Requirements
 
-The current candidate has been verified on:
+The currently verified environment is:
 
 - Windows x64
 - Node.js `>=22.19.0`
-- Pi `>=0.84.3`
+- Pi `>=0.84.3 <=0.85.1`
 
 macOS and Linux are not supported by this version.
 
 Pi must be installed first and started in an interactive terminal.
 
-Pi `0.85.0` also requires the matching `@earendil-works/pi-server@0.85.0` package because that Pi package does not declare the dependency itself. This is an upstream prerequisite, not an AgentGlass runtime dependency.
+### Known Pi limitation
 
-## Install
+Pi `0.85.1` may exit with `RangeError: Maximum call stack size exceeded` while rendering a very large built-in `edit` preview (reproduced at approximately 8 MiB). This happens before AgentGlass receives the tool call, so AgentGlass cannot show an approval card or verify the result. Do not treat the crash as a safe block. Until an official Pi fix is available, split very large edits into smaller steps. See [Pi issue #8036](https://github.com/earendil-works/pi/issues/8036).
 
-The npm package is not published yet. Install the real tarball in an isolated directory, then install its package directory in Pi:
+## Quick start
+
+### A. Download the `.tgz` resource package
+
+Download `ddt-agentglass-0.8.0.tgz`, then run this in PowerShell:
 
 ```powershell
-npm install C:\path\to\ddt-agentglass-0.8.0.tgz `
-  --prefix .\agentglass-install --omit=dev --no-save
-pi install .\agentglass-install\node_modules\@ddt\agentglass
+$package = 'C:\path\to\ddt-agentglass-0.8.0.tgz'
+$install = Join-Path (Get-Location) 'agentglass-install'
+npm install $package --prefix $install --omit=dev --no-save --ignore-scripts
+pi install (Join-Path $install 'node_modules\@ddt\agentglass')
+```
+
+### B. Install from npm
+
+`@ddt/agentglass` is not published to the npm registry yet. After publication, use:
+
+```powershell
+$install = Join-Path (Get-Location) 'agentglass-install'
+npm install @ddt/agentglass@0.8.0 --prefix $install --omit=dev --no-save --ignore-scripts
+pi install (Join-Path $install 'node_modules\@ddt\agentglass')
 ```
 
 Start Pi in the project you want to protect:
@@ -73,11 +88,11 @@ Then run:
 /agentglass example
 ```
 
-Pi treats a local `.tgz` path as a single extension rather than as this package's manifest. Use the installed package directory shown above.
+Pi treats a local `.tgz` path as a single extension rather than as this package's manifest. Always give `pi install` the installed package directory shown above.
 
 ## Unsupported operations
 
-AgentGlass does not approve or run shell commands, dependency installation, project startup, deployment, bulk deletion, process management, or unknown/custom/overridden tools. It does not claim OS-level sandboxing or protection from a malicious co-resident Pi extension.
+AgentGlass does not approve or run shell commands, dependency installation, project startup, deployment, bulk deletion, process management, or unknown/custom/overridden tools. It does not claim OS-level sandboxing or protection from a malicious co-resident Pi extension modifying tool input.
 
 If a task is blocked, ask Pi to make the request smaller or file-oriented. Do not disable AgentGlass as a way to continue a blocked task.
 

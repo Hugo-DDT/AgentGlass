@@ -28,6 +28,32 @@ const LOCK_NAME = ".snapshot.lock";
 const WINDOWS_ACL_APPLY_ATTEMPTS = 3;
 const execFileAsync = promisify(execFile);
 
+function evidence(
+  values: Partial<PreImageSnapshotEvidence> = {},
+): PreImageSnapshotEvidence {
+  return Object.freeze({
+    status: "not_applicable",
+    snapshotId: null,
+    targetExisted: "unknown",
+    permissionMetadata: "unknown",
+    failureCode: null,
+    canRestoreNow: false,
+    recoveryGrade: "unknown",
+    ...values,
+  });
+}
+
+export function noPreImageSnapshot(): PreImageSnapshotEvidence {
+  return evidence();
+}
+
+export function unavailablePreImageSnapshot(
+  failureCode: SnapshotFailureCode,
+  targetExisted: PreImageSnapshotEvidence["targetExisted"] = "unknown",
+): PreImageSnapshotEvidence {
+  return evidence({ status: "unavailable", failureCode, targetExisted });
+}
+
 export interface SensitiveSnapshotTarget {
   actionId: string;
   targetId: string;
@@ -198,32 +224,6 @@ $actualKeys = @($actualRules | ForEach-Object { RuleKey $_ } | Sort-Object) -joi
 if ($expectedKeys -ne $actualKeys) { exit 1 }
 exit 0
 `;
-
-function evidence(
-  values: Partial<PreImageSnapshotEvidence> = {},
-): PreImageSnapshotEvidence {
-  return Object.freeze({
-    status: "not_applicable",
-    snapshotId: null,
-    targetExisted: "unknown",
-    permissionMetadata: "unknown",
-    failureCode: null,
-    canRestoreNow: false,
-    recoveryGrade: "unknown",
-    ...values,
-  });
-}
-
-export function noPreImageSnapshot(): PreImageSnapshotEvidence {
-  return evidence();
-}
-
-export function unavailablePreImageSnapshot(
-  failureCode: SnapshotFailureCode,
-  targetExisted: PreImageSnapshotEvidence["targetExisted"] = "unknown",
-): PreImageSnapshotEvidence {
-  return evidence({ status: "unavailable", failureCode, targetExisted });
-}
 
 function fail(code: SnapshotFailureCode): never {
   throw new SnapshotError(code);

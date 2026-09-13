@@ -1,12 +1,12 @@
 # AgentGlass
 
-[English](./README.md)
+[中文](./README.zh-CN.md) · [English](./README.md)
 
 **一个面向新手的 [Pi  Agent](https://github.com/earendil-works/pi) 文件变更审批扩展。**
 
 AgentGlass 面向不熟悉 shell 命令、Git diff 和文件风险的新手用户。它用易懂的语言说明 Pi 准备带来的文件结果，让用户在文件真正变化前确认这个结果。
 
-> **0.8.0 候选版本 · 仅支持 Windows · 尚未发布**
+> **0.8.0 · 仅支持 Windows**
 
 ## 为什么需要 AgentGlass？
 
@@ -42,22 +42,37 @@ AI 助手可能提出技术上有效的文件操作，却没有让新手看清�
 
 - Windows x64
 - Node.js `>=22.19.0`
-- Pi `>=0.84.3`
+- Pi `>=0.84.3 <=0.85.1`
 
 当前版本不支持 macOS 和 Linux。
 
 Pi 需要先安装，并在可交互终端中启动。
 
-Pi `0.85.0` 还需要安装匹配版本的 `@earendil-works/pi-server@0.85.0`，因为该 Pi 包自身没有声明这个依赖。这是上游前置条件，不是 AgentGlass 的运行时依赖。
+### 注意
 
-## 安装
+Pi `0.85.1` 在渲染非常大的内置 `edit` 预览时可能因 `RangeError: Maximum call stack size exceeded` 退出（已在约 8 MiB 的预览中复现）。这发生在 AgentGlass 收到工具调用之前，因此 AgentGlass 无法显示审批卡或核验结果。不要把宿主崩溃当成安全阻止。在 Pi 官方修复发布前，请把非常大的修改拆成较小步骤。参见 [Pi issue #8036](https://github.com/earendil-works/pi/issues/8036)。
 
-npm 包尚未发布。先在隔离目录中安装真实 tarball，再把安装目录交给 Pi：
+## 快速开始
+
+### A. 直接下载 `.tgz` 资源包
+
+下载 `ddt-agentglass-0.8.0.tgz` 后，在 PowerShell 中执行：
 
 ```powershell
-npm install C:\path\to\ddt-agentglass-0.8.0.tgz `
-  --prefix .\agentglass-install --omit=dev --no-save
-pi install .\agentglass-install\node_modules\@ddt\agentglass
+$package = 'C:\path\to\ddt-agentglass-0.8.0.tgz'
+$install = Join-Path (Get-Location) 'agentglass-install'
+npm install $package --prefix $install --omit=dev --no-save --ignore-scripts
+pi install (Join-Path $install 'node_modules\@ddt\agentglass')
+```
+
+### B. 从 npm 安装
+
+`@ddt/agentglass` 目前还没有发布到 npm registry。发布后执行：
+
+```powershell
+$install = Join-Path (Get-Location) 'agentglass-install'
+npm install @ddt/agentglass@0.8.0 --prefix $install --omit=dev --no-save --ignore-scripts
+pi install (Join-Path $install 'node_modules\@ddt\agentglass')
 ```
 
 在需要保护的项目目录中启动 Pi：
@@ -73,7 +88,7 @@ pi
 /agentglass example
 ```
 
-Pi 会把本地 `.tgz` 路径当作单个扩展，而不是按本包 manifest 安装；请使用上面的已安装包目录。
+Pi 会把本地 `.tgz` 路径当作单个扩展，而不是按本包 manifest 安装；请始终把上面的已安装包目录交给 `pi install`。
 
 ## 不支持的操作
 
