@@ -343,16 +343,22 @@ async function secureStorageRoot(snapshotRoot: string): Promise<void> {
     fail("SNAPSHOT_STORAGE_UNSAFE");
 
   if (process.platform === "win32") {
-    try {
-      // Node 的 mode 位在 Windows 上不能证明 ACL 私有；发布前用系统 ACL API 固定并复核。
-      await runPowerShell(
-        WINDOWS_PRIVATE_DIRECTORY_SCRIPT + WINDOWS_VERIFY_PRIVATE_ACL_SCRIPT,
-        snapshotRoot,
-      );
-    } catch {
-      fail("SNAPSHOT_STORAGE_UNSAFE");
+    // Node 的 mode 位在 Windows 上不能证明 ACL 私有；发布前用系统 ACL API 固定并复核。
+    // Windows runner/杀毒软件可能让一次 ACL 子进程调用瞬时失败；只重试完整的“设置并复核”，
+    // 三次都失败仍失败关闭，绝不把未知权限状态当作私有目录。
+    for (let attempt = 0; attempt < WINDOWS_ACL_APPLY_ATTEMPTS; attempt += 1) {
+      try {
+        await runPowerShell(
+          WINDOWS_PRIVATE_DIRECTORY_SCRIPT + WINDOWS_VERIFY_PRIVATE_ACL_SCRIPT,
+          snapshotRoot,
+        );
+        return;
+      } catch {
+        if (attempt + 1 < WINDOWS_ACL_APPLY_ATTEMPTS)
+          await new Promise((resolve) => setTimeout(resolve, 50));
+      }
     }
-    return;
+    fail("SNAPSHOT_STORAGE_UNSAFE");
   }
 
   await chmod(snapshotRoot, 0o700);
