@@ -1,4 +1,11 @@
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -173,6 +180,7 @@ function installApprovalUi(
   runtime: Awaited<ReturnType<typeof createRuntime>>,
   steps: ApprovalUiStep[],
   mode: "tui" | "rpc" | "print" | "json" = "tui",
+  qualifiedWeb: boolean | (() => boolean) = false,
 ) {
   const runner = runtime.session.extensionRunner;
   const base = runner.getUIContext();
@@ -231,6 +239,18 @@ function installApprovalUi(
   runner.setUIContext(
     {
       ...base,
+      ...(qualifiedWeb
+        ? {
+            agentglassApproval: {
+              capabilityId: "agentglass.pi-web.approval" as const,
+              capabilityVersion: 1 as const,
+              isAvailable: () =>
+                typeof qualifiedWeb === "function"
+                  ? qualifiedWeb()
+                  : qualifiedWeb,
+            },
+          }
+        : {}),
       custom,
       setStatus: (key, text) => statuses.push({ key, text }),
       setWidget: (key, content) =>
@@ -761,9 +781,34 @@ test("Pi 0.85.1 capability modes do not equate hasUI with safe approval", async 
   await setGoal(runtime, "inspect modes");
   const runner = runtime.session.extensionRunner;
   const dialogContext = runner.getUIContext();
+  const qualifiedWebContext = {
+    ...dialogContext,
+    agentglassApproval: {
+      capabilityId: "agentglass.pi-web.approval" as const,
+      capabilityVersion: 1 as const,
+      isAvailable: () => true,
+    },
+  };
+  const futureWebContext = {
+    ...qualifiedWebContext,
+    agentglassApproval: {
+      ...qualifiedWebContext.agentglassApproval,
+      capabilityVersion: 2 as const,
+    },
+  };
+  const unavailableWebContext = {
+    ...qualifiedWebContext,
+    agentglassApproval: {
+      ...qualifiedWebContext.agentglassApproval,
+      isAvailable: () => false,
+    },
+  };
   const cases = [
     ["tui", dialogContext, "local_interactive", "yes"],
     ["rpc", dialogContext, "remote_interactive", "no"],
+    ["rpc", qualifiedWebContext, "remote_interactive", "yes"],
+    ["rpc", futureWebContext, "remote_interactive", "no"],
+    ["rpc", unavailableWebContext, "remote_interactive", "no"],
     ["json", undefined, "event_stream", "no"],
     ["print", undefined, "one_shot", "no"],
     ["tui", undefined, "unknown", "unknown"],
@@ -792,6 +837,188 @@ test("Pi 0.85.1 capability modes do not equate hasUI with safe approval", async 
       isError: false,
     });
   }
+});
+
+test("qualified Pi Web RPC runs the same approved action path as TUI", async () => {
+  const runtime = await createRuntime();
+  const ui = installApprovalUi(
+    runtime,
+    [{ inputs: ["down", "down", "enter"] }],
+    "rpc",
+    true,
+  );
+  const call = {
+    id: "qualified-web-write",
+    name: "write",
+    arguments: { path: "qualified-web.txt", content: "approved" },
+  };
+  expect(await emitCall(runtime, call)).toBeUndefined();
+  await writeFile(join(runtime.cwd, call.arguments.path), "approved", "utf8");
+  await runtime.session.extensionRunner.emitToolResult({
+    type: "tool_result",
+    toolCallId: call.id,
+    toolName: call.name,
+    input: call.arguments,
+    content: [{ type: "text", text: "ignored" }],
+    details: undefined,
+    isError: false,
+  });
+  await runtime.session.extensionRunner.emit({
+    type: "tool_execution_end",
+    toolCallId: call.id,
+    toolName: call.name,
+    result: {},
+    isError: false,
+  });
+  expect(ui.customCalls).toBe(1);
+  expect(ui.widgets.at(-1)?.content?.join("\n")).toContain("已确认");
+});
+
+test("qualified Pi Web RPC fails closed when its connection becomes invalid", async () => {
+  const runtime = await createRuntime();
+  let available = true;
+  const ui = installApprovalUi(
+    runtime,
+    [
+      {
+        onOpen: () => {
+          available = false;
+        },
+        inputs: ["down", "down", "enter"],
+      },
+    ],
+    "rpc",
+    () => available,
+  );
+  const result = await emitCall(runtime, {
+    id: "web-disconnected-write",
+    name: "write",
+    arguments: { path: "web-disconnected.txt", content: "must not run" },
+  });
+  expect(result).toMatchObject({
+    block: true,
+    reason: expect.stringContaining("动作或运行环境发生变化"),
+  });
+  expect(ui.customCalls).toBe(1);
+  expect(
+    await access(join(runtime.cwd, "web-disconnected.txt")).catch(
+      () => undefined,
+    ),
+  ).toBeUndefined();
+});
+
+test("qualified Pi Web example fails closed when its connection invalidates before consume", async () => {
+  const runtime = await createRuntime();
+  let available = true;
+  const ui = installApprovalUi(
+    runtime,
+    [
+      {
+        onOpen: () => {
+          // 模拟审批卡已返回 Continue 后，服务端 owner connection 在最终检查前失效。
+          available = false;
+        },
+        inputs: ["down", "down", "enter"],
+      },
+    ],
+    "rpc",
+    () => available,
+  );
+
+  await runtime.session.prompt("/agentglass example");
+
+  expect(
+    await access(join(runtime.cwd, "agentglass-example", "活动说明.txt")).catch(
+      () => undefined,
+    ),
+  ).toBeUndefined();
+  expect(ui.notifications.at(-1)?.message).toContain("动作或运行环境发生变化");
+});
+
+test("qualified Pi Web restore fails closed when its connection invalidates before consume", async () => {
+  const runtime = await createRuntime();
+  let available = true;
+  const ui = installApprovalUi(
+    runtime,
+    [
+      { inputs: ["down", "down", "enter"] },
+      {
+        onOpen: () => {
+          available = false;
+        },
+        inputs: ["down", "down", "enter"],
+      },
+    ],
+    "rpc",
+    () => available,
+  );
+  const targetPath = join(runtime.cwd, "web-restore.txt");
+  const call = {
+    id: "web-restore-original",
+    name: "write",
+    arguments: { path: "web-restore.txt", content: "after" },
+  };
+  await writeFile(targetPath, "before", "utf8");
+  expect(await emitCall(runtime, call)).toBeUndefined();
+  await writeFile(targetPath, "after", "utf8");
+  await runtime.session.extensionRunner.emitToolResult({
+    type: "tool_result",
+    toolCallId: call.id,
+    toolName: call.name,
+    input: call.arguments,
+    content: [],
+    details: undefined,
+    isError: false,
+  });
+
+  await runtime.session.prompt("/agentglass restore");
+
+  expect(await readFile(targetPath, "utf8")).toBe("after");
+  expect(ui.notifications.at(-1)?.message).toContain("动作或运行环境发生变化");
+});
+
+test("qualified Pi Web cleanup fails closed when its connection invalidates before consume", async () => {
+  const runtime = await createRuntime();
+  let available = true;
+  const ui = installApprovalUi(
+    runtime,
+    [
+      { inputs: ["down", "down", "enter"] },
+      {
+        onOpen: () => {
+          available = false;
+        },
+        inputs: ["down", "down", "enter"],
+      },
+    ],
+    "rpc",
+    () => available,
+  );
+  const targetPath = join(runtime.cwd, "web-cleanup.txt");
+  const call = {
+    id: "web-cleanup-original",
+    name: "write",
+    arguments: { path: "web-cleanup.txt", content: "after" },
+  };
+  await writeFile(targetPath, "before", "utf8");
+  expect(await emitCall(runtime, call)).toBeUndefined();
+  await writeFile(targetPath, "after", "utf8");
+  await runtime.session.extensionRunner.emitToolResult({
+    type: "tool_result",
+    toolCallId: call.id,
+    toolName: call.name,
+    input: call.arguments,
+    content: [],
+    details: undefined,
+    isError: false,
+  });
+  const snapshotDirectory = join(runtime.cwd, ".agentglass", "snapshots");
+  const beforeCleanup = await readdir(snapshotDirectory);
+
+  await runtime.session.prompt("/agentglass cleanup");
+
+  expect(await readdir(snapshotDirectory)).toEqual(beforeCleanup);
+  expect(ui.notifications.at(-1)?.message).toContain("动作或运行环境发生变化");
 });
 
 test("unknown and same-name overridden tools retain degraded identity", async () => {

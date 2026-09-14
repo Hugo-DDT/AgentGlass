@@ -134,7 +134,10 @@ interface TestComponent {
 }
 
 type TestCustomFactory<T> = (
-  tui: { requestRender(): void },
+  tui: {
+    requestRender(): void;
+    terminal: { rows: number; columns: number };
+  },
   theme: unknown,
   keybindings: { matches(data: string, key: string): boolean },
   done: (value: T) => void,
@@ -283,6 +286,7 @@ function installApprovalUi(
   runtime: E2ERuntime,
   steps: ApprovalStep[],
   mode: "tui" | "rpc" = "tui",
+  qualifiedWeb: boolean | (() => boolean) = false,
 ) {
   const runner = runtime.session.extensionRunner;
   const base = runner.getUIContext();
@@ -300,7 +304,10 @@ function installApprovalUi(
       finish = resolve;
     });
     const component = await factory(
-      { requestRender: () => {} },
+      {
+        requestRender: () => {},
+        terminal: { rows: 24, columns: 80 },
+      },
       base.theme,
       {
         matches: (data, key) =>
@@ -329,6 +336,18 @@ function installApprovalUi(
   runner.setUIContext(
     {
       ...base,
+      ...(qualifiedWeb
+        ? {
+            agentglassApproval: {
+              capabilityId: "agentglass.pi-web.approval" as const,
+              capabilityVersion: 1 as const,
+              isAvailable: () =>
+                typeof qualifiedWeb === "function"
+                  ? qualifiedWeb()
+                  : qualifiedWeb,
+            },
+          }
+        : {}),
       custom,
       setStatus: (key, text) => statuses.push({ key, text }),
       setWidget: (key, content) =>
@@ -556,6 +575,53 @@ describe.sequential("A-016 Pi 0.85.1 real dispatch E2E", () => {
       await readdir(join(runtime.agentDir, ".agentglass", "snapshots")),
     ).toEqual([]);
     expect(ui.customCalls).toBe(4);
+  });
+
+  test("W-003 qualified Pi Web RPC completes help, example, file workflow, recovery, and cleanup", async () => {
+    const runtime = await createRuntime();
+    const ui = installApprovalUi(
+      runtime,
+      [
+        { inputs: ["esc"] },
+        { inputs: ["down", "down", "enter"] },
+        { inputs: ["down", "down", "enter"] },
+        { inputs: ["down", "down", "enter"] },
+        { inputs: ["down", "down", "enter"] },
+      ],
+      "rpc",
+      true,
+    );
+
+    await runtime.session.prompt("/agentglass help");
+    await runtime.session.prompt("/agentglass example");
+    const examplePath = join(runtime.cwd, "agentglass-example", "活动说明.txt");
+    expect(await readFile(examplePath, "utf8")).toContain("社区旧物交换日");
+
+    await promptCalls(
+      runtime,
+      [
+        {
+          type: "toolCall",
+          id: "web-edit-example",
+          name: "edit",
+          arguments: {
+            path: "agentglass-example/活动说明.txt",
+            edits: [{ oldText: "现场登记。", newText: "网上登记。" }],
+          },
+        },
+      ],
+      "Web 审批示例",
+    );
+    expect(await readFile(examplePath, "utf8")).toContain("网上登记。");
+    await runtime.session.prompt("/agentglass restore");
+    expect(await readFile(examplePath, "utf8")).toContain("现场登记。");
+    await runtime.session.prompt("/agentglass cleanup");
+    expect(
+      await readdir(join(runtime.agentDir, ".agentglass", "snapshots")),
+    ).toEqual([]);
+    expect(ui.customCalls).toBe(5);
+    expect(ui.rendered.flat().join("\n")).toContain("AgentGlass 帮助");
+    expect(ui.widgets.at(-1)?.content?.join("\n")).toContain("清理结果");
   });
 
   test("Stop stays focused; details do not approve; Continue, Stop, Esc, and cancel remain distinct", async () => {

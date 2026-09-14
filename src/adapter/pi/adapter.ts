@@ -131,6 +131,8 @@ const BATCH_CONTEXT_REASON =
   "已停止：无法确认这次同时提出的操作是否完整。请让 Pi 一次只提出一个变更后重试。";
 const APPROVAL_UNAVAILABLE_REASON =
   "已停止：这一步需要你的明确确认，但当前模式没有可用的本地审批界面。请回到 Pi 交互窗口再试。";
+const AGENTGLASS_APPROVAL_CAPABILITY_ID = "agentglass.pi-web.approval";
+const AGENTGLASS_APPROVAL_CAPABILITY_VERSION = 1;
 const APPROVAL_STOPPED_REASON =
   "已停止：你没有批准这一步，因此这次修改没有获得执行许可。";
 const APPROVAL_CHANGED_REASON =
@@ -345,7 +347,7 @@ function setWelcomePanel(
   ctx: ExtensionContext,
   lines: readonly string[],
 ): void {
-  if (ctx.mode !== "tui" || !ctx.hasUI) return;
+  if (!hasQualifiedApprovalChannel(ctx)) return;
   try {
     // 欢迎/帮助是同一入口的非审批信息面板；不创建第二套 UI，也不把面板文字送回风险层。
     ctx.ui.setWidget(
@@ -575,6 +577,9 @@ async function showHelpOverlay(
   cwd: string,
   sections: readonly HelpSection[],
 ): Promise<void> {
+  // 帮助本身不授予文件权限，但也不能在 bridge 已失效后继续向旧连接发送交互面板。
+  // 调用者在进入异步准备阶段前会先检查一次，这里再守住真正调用 Pi UI 的边界。
+  if (!hasQualifiedApprovalChannel(ctx)) return;
   await ctx.ui.custom<void>(
     (tui, rawTheme, keybindings, done) => {
       const theme = usablePiTheme(rawTheme);
@@ -777,7 +782,7 @@ async function requestOutcomeApproval(
   pendingCancels: Set<() => void>,
 ): Promise<"continue" | "stop"> {
   const signal = ctx.signal;
-  if (ctx.mode !== "tui" || !ctx.hasUI || signal?.aborted) return "stop";
+  if (!hasQualifiedApprovalChannel(ctx)) return "stop";
 
   let cancelPrompt = (): void => {};
   let submitted: "continue" | "stop" | undefined;
@@ -1030,7 +1035,7 @@ function setActionCard(
   ctx: ExtensionContext,
   update: ReturnType<typeof renderOutcomeCardUpdate>,
 ): void {
-  if (ctx.mode !== "tui" || !ctx.hasUI) return;
+  if (!hasQualifiedApprovalChannel(ctx)) return;
   try {
     // modal 在 Continue 后由 Pi 关闭；稳定 key 让同一逻辑动作卡在原位置区域进入执行/结果态。
     ctx.ui.setWidget(
@@ -1043,7 +1048,7 @@ function setActionCard(
 }
 
 function setReadStatus(ctx: ExtensionContext, text: string): void {
-  if (ctx.mode !== "tui" || !ctx.hasUI) return;
+  if (!hasQualifiedApprovalChannel(ctx)) return;
   try {
     ctx.ui.setStatus(READ_STATUS_KEY, text);
   } catch {
@@ -1051,30 +1056,58 @@ function setReadStatus(ctx: ExtensionContext, text: string): void {
   }
 }
 
-export function mapPiCapabilities(
-  mode: ExtensionContext["mode"],
-  hasUI: boolean,
-): HostCapabilities {
-  if (mode === "tui" && hasUI) {
+type AgentGlassApprovalChannelLike = {
+  capabilityId?: unknown;
+  capabilityVersion?: unknown;
+  isAvailable?: unknown;
+};
+
+function hasQualifiedApprovalChannel(ctx: ExtensionContext): boolean {
+  // TUI 是 Pi 自带的本地交互通道；Web/RPC 必须额外经过版本化、动态的
+  // AgentGlass bridge 检查。仅有 mode、hasUI 或某个同名方法都不能授予审批能力。
+  if (!ctx.hasUI || ctx.signal?.aborted) return false;
+  if (ctx.mode === "tui") return true;
+  if (ctx.mode !== "rpc") return false;
+  const channel = (ctx.ui as unknown as { agentglassApproval?: unknown })
+    .agentglassApproval;
+  if (!channel || typeof channel !== "object") return false;
+  const candidate = channel as AgentGlassApprovalChannelLike;
+  if (
+    candidate.capabilityId !== AGENTGLASS_APPROVAL_CAPABILITY_ID ||
+    candidate.capabilityVersion !== AGENTGLASS_APPROVAL_CAPABILITY_VERSION ||
+    typeof candidate.isAvailable !== "function"
+  )
+    return false;
+  try {
+    return candidate.isAvailable() === true;
+  } catch {
+    return false;
+  }
+}
+
+export function mapPiCapabilities(ctx: ExtensionContext): HostCapabilities {
+  if (hasQualifiedApprovalChannel(ctx)) {
+    const interaction =
+      ctx.mode === "tui" ? "local_interactive" : "remote_interactive";
     return Object.freeze({
-      interaction: "local_interactive",
+      interaction,
       canPromptForApproval: "yes",
     });
   }
-  if (mode === "rpc" && hasUI) {
-    // Pi RPC 有 dialog transport，但 Alpha 的安全审批只接受本地 TUI 卡片。
+  if (ctx.mode === "rpc" && ctx.hasUI) {
+    // 普通 RPC 仍可能有 dialog transport，但缺少 AgentGlass v1 bridge 时不能审批。
     return Object.freeze({
       interaction: "remote_interactive",
       canPromptForApproval: "no",
     });
   }
-  if (mode === "json" && !hasUI) {
+  if (ctx.mode === "json" && !ctx.hasUI) {
     return Object.freeze({
       interaction: "event_stream",
       canPromptForApproval: "no",
     });
   }
-  if (mode === "print" && !hasUI) {
+  if (ctx.mode === "print" && !ctx.hasUI) {
     return Object.freeze({
       interaction: "one_shot",
       canPromptForApproval: "no",
@@ -1232,7 +1265,7 @@ function mapToolCall(
       sessionId,
       cwd: ctx.cwd,
       tool: mapToolIdentity(call.name, tools),
-      capabilities: mapPiCapabilities(ctx.mode, ctx.hasUI),
+      capabilities: mapPiCapabilities(ctx),
       siblings: references,
       userGoal,
       rawInput: call.id === event.toolCallId ? event.input : call.arguments,
@@ -1410,6 +1443,20 @@ export function registerPiAdapter(
     }
   };
 
+  const approvalChannelStillValid = (
+    ctx: ExtensionContext,
+    token: ApprovalToken,
+  ): boolean => {
+    // 示例、恢复和清理各自包含异步文件/恢复证据检查；审批返回后必须在最后一个
+    // await 之后同步复核 bridge，再消费单次 token。否则连接可能已经失效，而原有
+    // fingerprint/cwd/session/toolCall 绑定仍相同，导致旧 UI 批准错误地进入文件操作。
+    if (hasQualifiedApprovalChannel(ctx)) return true;
+    invalidateApprovalToken(token);
+    pendingTokens.delete(token);
+    notify(ctx, APPROVAL_CHANGED_REASON, "warning");
+    return false;
+  };
+
   const rememberResult = (lines: readonly string[]): void => {
     latestResult = Object.freeze([...lines]);
   };
@@ -1542,6 +1589,7 @@ export function registerPiAdapter(
       );
       return;
     }
+    if (!approvalChannelStillValid(ctx, token)) return;
     let finalBinding: Readonly<ExecutionBinding>;
     try {
       finalBinding = internalBinding(
@@ -1646,7 +1694,7 @@ export function registerPiAdapter(
       ) {
         latestRecovery = undefined;
       }
-      if (ctx.mode !== "tui" || !ctx.hasUI) {
+      if (!hasQualifiedApprovalChannel(ctx)) {
         notify(ctx, APPROVAL_UNAVAILABLE_REASON, "warning");
         return;
       }
@@ -1674,6 +1722,10 @@ export function registerPiAdapter(
           "× 清理本地恢复数据",
           "关闭",
         ];
+        if (!hasQualifiedApprovalChannel(ctx)) {
+          notify(ctx, APPROVAL_UNAVAILABLE_REASON, "warning");
+          return;
+        }
         const choice = await ctx.ui.select("🛡 AgentGlass", menuOptions);
         action =
           choice === menuOptions[0]
@@ -1775,6 +1827,7 @@ export function registerPiAdapter(
           notify(ctx, "已停止：批准期间恢复依据或当前文件已变化。", "warning");
           return;
         }
+        if (!approvalChannelStillValid(ctx, token)) return;
         const finalBinding = internalBinding(
           "agentglass.restore",
           ctx,
@@ -1857,6 +1910,7 @@ export function registerPiAdapter(
           return;
         }
         const current = await snapshots.inspectCleanupSet(snapshotRoot);
+        if (!approvalChannelStillValid(ctx, token)) return;
         const finalBinding = internalBinding(
           "agentglass.cleanup",
           ctx,
@@ -1925,8 +1979,7 @@ export function registerPiAdapter(
       sessionId = undefined;
     }
     if (
-      ctx.mode === "tui" &&
-      ctx.hasUI &&
+      hasQualifiedApprovalChannel(ctx) &&
       nonEmptyString(ctx.cwd) &&
       welcomedCwd !== ctx.cwd
     ) {
@@ -1947,6 +2000,7 @@ export function registerPiAdapter(
   pi.on("tool_call", async (event, ctx) => {
     let batch: readonly TransientHostExecutionInput[];
     let currentToken: ApprovalToken | undefined;
+    let approvalAttempted = false;
     const toolCallId = event.toolCallId;
     try {
       if (activeExecutions.has(toolCallId)) throw new Error();
@@ -2054,12 +2108,16 @@ export function registerPiAdapter(
           };
         }
         if (
-          ctx.mode !== "tui" ||
-          !ctx.hasUI ||
+          !hasQualifiedApprovalChannel(ctx) ||
           observed.capabilities.canPromptForApproval !== "yes"
         ) {
           activeExecutions.delete(toolCallId);
-          return { block: true as const, reason: APPROVAL_UNAVAILABLE_REASON };
+          return {
+            block: true as const,
+            reason: approvalAttempted
+              ? APPROVAL_CHANGED_REASON
+              : APPROVAL_UNAVAILABLE_REASON,
+          };
         }
 
         verificationTarget = await resolveCurrentSnapshot(
@@ -2098,6 +2156,7 @@ export function registerPiAdapter(
         );
         currentToken = token;
         pendingTokens.add(token);
+        approvalAttempted = true;
         const choice = await requestOutcomeApproval(
           ctx,
           card,
@@ -2108,7 +2167,12 @@ export function registerPiAdapter(
           pendingTokens.delete(token);
           currentToken = undefined;
           activeExecutions.delete(toolCallId);
-          return { block: true as const, reason: APPROVAL_STOPPED_REASON };
+          return {
+            block: true as const,
+            reason: hasQualifiedApprovalChannel(ctx)
+              ? APPROVAL_STOPPED_REASON
+              : APPROVAL_CHANGED_REASON,
+          };
         }
 
         const current = await assessCurrent(event, ctx);
