@@ -60,25 +60,12 @@ Pi `0.85.1` 在渲染非常大的内置 `edit` 预览时可能因 `RangeError: M
 
 ## 快速开始
 
-### A. 直接下载 `.tgz` 资源包
+### 安装扩展
 
-下载 `ddt-agentglass-0.8.0.tgz` 后，在 PowerShell 中执行：
+在使用 Pi 的项目目录中执行：
 
-```powershell
-$package = 'C:\path\to\ddt-agentglass-0.8.0.tgz'
-$install = Join-Path (Get-Location) 'agentglass-install'
-npm install $package --prefix $install --omit=dev --no-save --ignore-scripts
-pi install (Join-Path $install 'node_modules\@ddt\agentglass')
-```
-
-### B. 从 npm 安装
-
-`@ddt/agentglass` 目前还没有发布到 npm registry。发布后执行：
-
-```powershell
-$install = Join-Path (Get-Location) 'agentglass-install'
-npm install @ddt/agentglass@0.8.0 --prefix $install --omit=dev --no-save --ignore-scripts
-pi install (Join-Path $install 'node_modules\@ddt\agentglass')
+```text
+pi install npm:@hugo-ddt/agentglass@0.8.0
 ```
 
 在需要保护的项目目录中启动 Pi：
@@ -93,8 +80,6 @@ pi
 /agentglass help
 /agentglass example
 ```
-
-Pi 会把本地 `.tgz` 路径当作单个扩展，而不是按本包 manifest 安装；请始终把上面的已安装包目录交给 `pi install`。
 
 ## 不支持的操作
 

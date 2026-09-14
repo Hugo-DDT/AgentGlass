@@ -1,5 +1,5 @@
 {
-  "name": "@ddt/agentglass",
+  "name": "@hugo-ddt/agentglass",
   "version": "0.8.0",
   "description": "A novice outcome-approval layer for supported Pi file changes.",
   "type": "module",

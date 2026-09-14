@@ -15,7 +15,7 @@ test("Pi 0.85.1 discovers the package manifest and loads the real TS entry", asy
     await readFile(join(root, "package.json"), "utf8"),
   );
   expect(manifest).toMatchObject({
-    name: "@ddt/agentglass",
+    name: "@hugo-ddt/agentglass",
     type: "module",
     engines: { node: ">=22.19.0" },
     keywords: ["pi-package"],

@@ -60,25 +60,12 @@ Pi `0.85.1` may exit with `RangeError: Maximum call stack size exceeded` while r
 
 ## Quick start
 
-### A. Download the `.tgz` resource package
+### Install the package
 
-Download `ddt-agentglass-0.8.0.tgz`, then run this in PowerShell:
+Run this in the project where you use Pi:
 
-```powershell
-$package = 'C:\path\to\ddt-agentglass-0.8.0.tgz'
-$install = Join-Path (Get-Location) 'agentglass-install'
-npm install $package --prefix $install --omit=dev --no-save --ignore-scripts
-pi install (Join-Path $install 'node_modules\@ddt\agentglass')
-```
-
-### B. Install from npm
-
-`@ddt/agentglass` is not published to the npm registry yet. After publication, use:
-
-```powershell
-$install = Join-Path (Get-Location) 'agentglass-install'
-npm install @ddt/agentglass@0.8.0 --prefix $install --omit=dev --no-save --ignore-scripts
-pi install (Join-Path $install 'node_modules\@ddt\agentglass')
+```text
+pi install npm:@hugo-ddt/agentglass@0.8.0
 ```
 
 Start Pi in the project you want to protect:
@@ -93,8 +80,6 @@ Then run:
 /agentglass help
 /agentglass example
 ```
-
-Pi treats a local `.tgz` path as a single extension rather than as this package's manifest. Always give `pi install` the installed package directory shown above.
 
 ## Unsupported operations
 
