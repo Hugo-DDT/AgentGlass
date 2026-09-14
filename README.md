@@ -27,6 +27,8 @@ The user approves the expected outcome and impact—not a command, a tool name, 
 
 Ordinary reads do not require an approval card after the required safety checks pass.
 
+![AgentGlass](.\src\docs\AgentGlass.png)
+
 ## Features
 
 - **Beginner-friendly explanations**: focus on file results and impact instead of shell syntax or hidden reasoning.
@@ -35,6 +37,10 @@ Ordinary reads do not require an approval card after the required safety checks 
 - **Separate recovery approval**: `/agentglass restore` requires its own approval and only uses evidence-backed recovery capability.
 - **Separate cleanup approval**: `/agentglass cleanup` handles validated private AgentGlass data and cannot delete project files.
 - **Safe example**: `/agentglass example` provides a fixed, no-secret file workflow.
+
+![AgentGlass-hlep](.\src\docs\AgentGlass-hlep.png)
+
+![AgentGlass-edit](.\src\docs\AgentGlass-edit.png)
 
 ## Requirements
 
