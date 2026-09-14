@@ -27,7 +27,7 @@ AI 助手可能提出技术上有效的文件操作，却没有让新手看清�
 
 普通读取在必要安全检查全部通过后，不需要审批卡片。
 
-![AgentGlass](.\src\docs\AgentGlass.png)
+![AgentGlass](./src/docs/AgentGlass.png)
 
 ## 功能
 
@@ -38,9 +38,9 @@ AI 助手可能提出技术上有效的文件操作，却没有让新手看清�
 - **清理独立批准**：`/agentglass cleanup` 只处理已验证的 AgentGlass 私有数据，不能删除项目文件。
 - **安全示例**：`/agentglass example` 提供固定的无秘密文件流程。
 
-![AgentGlass-hlep](.\src\docs\AgentGlass-hlep.png)
+![AgentGlass-hlep](./src/docs/AgentGlass-hlep.png)
 
-![AgentGlass-edit](.\src\docs\AgentGlass-edit.png)
+![AgentGlass-edit](./src/docs/AgentGlass-edit.png)
 
 ## 环境要求
 
