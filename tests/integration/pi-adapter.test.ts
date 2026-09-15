@@ -2,15 +2,18 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  type AgentSessionRuntime,
   createAgentSession,
   createReadToolDefinition,
   DefaultResourceLoader,
   type ExtensionUIContext,
+  InteractiveMode,
   ModelRuntime,
   SessionManager,
   SettingsManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { Editor } from "@earendil-works/pi-tui";
 import { afterEach, expect, test, vi } from "vitest";
 import { registerPiAdapter } from "../../src/adapter/pi/adapter.js";
 import {
@@ -22,6 +25,7 @@ import type {
   ExecutionBinding,
   HostExecutionFacts,
 } from "../../src/core/domain.js";
+import * as inputBoundary from "../../src/core/input-boundary.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -254,6 +258,102 @@ function installApprovalUi(
       return doneCalls;
     },
   };
+}
+
+interface StarterDialogStep {
+  value?: string;
+  error?: boolean;
+  onOpen?: (controls: {
+    setEditorText(text: string): void;
+    setCwd(cwd: string): void;
+  }) => void | Promise<void>;
+}
+
+function installStarterUi(
+  runtime: Awaited<ReturnType<typeof createRuntime>>,
+  steps: StarterDialogStep[],
+  options?: {
+    editorText?: string;
+    getEditorTextError?: boolean;
+    getEditorTextErrorAt?: number;
+    setEditorTextError?: boolean;
+  },
+) {
+  const runner = runtime.session.extensionRunner;
+  const base = runner.getUIContext();
+  let editorText = options?.editorText ?? "";
+  let dialogCalls = 0;
+  let getEditorTextCalls = 0;
+  let setCalls = 0;
+  const editorEvents: Array<"get" | "set"> = [];
+  const dialogTitles: string[] = [];
+  const notifications: Array<{ message: string; type: string | undefined }> =
+    [];
+  const takeStep = async (title: string): Promise<string | undefined> => {
+    dialogTitles.push(title);
+    const step = steps[dialogCalls++];
+    if (!step) return undefined;
+    await step.onOpen?.({
+      setEditorText: (text) => (editorText = text),
+      // 测试真实 ExtensionRunner 的动态 cwd getter；生产代码不提供此旁路。
+      setCwd: (cwd) => {
+        (runner as unknown as { cwd: string }).cwd = cwd;
+      },
+    });
+    if (step.error) throw new Error("synthetic starter UI error");
+    return step.value;
+  };
+  runner.setUIContext(
+    {
+      ...base,
+      select: (title) => takeStep(title),
+      input: (title) => takeStep(title),
+      getEditorText: () => {
+        editorEvents.push("get");
+        getEditorTextCalls += 1;
+        if (
+          options?.getEditorTextError ||
+          options?.getEditorTextErrorAt === getEditorTextCalls
+        )
+          throw new Error("synthetic editor read error");
+        return editorText;
+      },
+      setEditorText: (text) => {
+        editorEvents.push("set");
+        setCalls += 1;
+        if (options?.setEditorTextError)
+          throw new Error("synthetic editor write error");
+        editorText = text;
+      },
+      notify: (message, type) => notifications.push({ message, type }),
+    },
+    "tui",
+  );
+  return {
+    dialogTitles,
+    notifications,
+    get dialogCalls() {
+      return dialogCalls;
+    },
+    get setCalls() {
+      return setCalls;
+    },
+    get getEditorTextCalls() {
+      return getEditorTextCalls;
+    },
+    editorEvents,
+    get editorText() {
+      return editorText;
+    },
+  };
+}
+
+async function runStarter(
+  runtime: Awaited<ReturnType<typeof createRuntime>>,
+): Promise<void> {
+  await runtime.session.prompt("/agentglass", {
+    expandPromptTemplates: true,
+  });
 }
 
 async function setGoal(
@@ -1766,4 +1866,517 @@ test("B-003 help falls back to a compact widget when the floating view fails", a
   expect(fallback).toContain("✓ 能力");
   expect(fallback).toContain("× 限制");
   expect(ui.notifications.at(-1)?.message).toContain("帮助浮层无法打开");
+});
+
+test("N-001 verifies the locked Pi editor setter is synchronous and does not submit", () => {
+  let submitted = 0;
+  const editor = new Editor({ requestRender: () => {} } as never, {
+    borderColor: (value) => value,
+    selectList: {} as never,
+  });
+  editor.onSubmit = () => {
+    submitted += 1;
+  };
+
+  editor.setText("用户草稿");
+
+  expect(editor.getText()).toBe("用户草稿");
+  expect(editor.getExpandedText()).toBe("用户草稿");
+  expect(submitted).toBe(0);
+});
+
+test("N-001 verifies locked Pi InteractiveMode editor UI mapping without submission", async () => {
+  const runtime = await createRuntime();
+  const runtimeHost = {
+    session: runtime.session,
+    setBeforeSessionInvalidate: () => {},
+    setRebindSession: () => {},
+  } as unknown as AgentSessionRuntime;
+  const interactiveMode = new InteractiveMode(runtimeHost);
+
+  try {
+    // 直接使用锁定包的 InteractiveMode 生成 ExtensionUIContext，不能用
+    // runner.setUIContext 覆盖 get/set；这样才能验证 Pi 宿主实际的 editor wiring。
+    const ui = (
+      interactiveMode as unknown as {
+        createExtensionUIContext: () => ExtensionUIContext;
+      }
+    ).createExtensionUIContext();
+    const editor = (
+      interactiveMode as unknown as {
+        editor: { onSubmit: (text: string) => void };
+      }
+    ).editor;
+    let submitted = 0;
+    editor.onSubmit = () => {
+      submitted += 1;
+    };
+
+    ui.setEditorText("真实 InteractiveMode 草稿");
+
+    expect(ui.getEditorText()).toBe("真实 InteractiveMode 草稿");
+    expect(submitted).toBe(0);
+  } finally {
+    interactiveMode.stop();
+  }
+});
+
+test("N-001 fills the three local Chinese starter drafts without sending or changing files", async () => {
+  const cases = [
+    {
+      steps: [
+        { value: "✦ 开始一个文件任务" },
+        { value: "创建说明" },
+        { value: "docs/activity.md" },
+        { value: "为新成员说明活动流程" },
+      ],
+      expected: "请为这个文件创建一份说明。",
+    },
+    {
+      steps: [
+        { value: "✦ 开始一个文件任务" },
+        { value: "润色文案" },
+        { value: "copy.md" },
+        { value: "语气更清楚" },
+        { value: "活动日期和报名方式" },
+      ],
+      expected: "请先查看这个文件，再按要求润色文案。",
+    },
+    {
+      steps: [
+        { value: "✦ 开始一个文件任务" },
+        { value: "整理文本" },
+        { value: "notes.md" },
+        { value: "按主题分组并补充标题" },
+        { value: "保留原有事实" },
+      ],
+      expected: "请先查看这个文件，再按要求整理文本结构。",
+    },
+  ];
+
+  for (const item of cases) {
+    const runtime = await createRuntime();
+    const beforeFiles = await readdir(runtime.cwd);
+    const sendUserMessage = vi.spyOn(runtime.session, "sendUserMessage");
+    const ui = installStarterUi(runtime, item.steps);
+
+    await runStarter(runtime);
+
+    expect(ui.editorText).toContain(item.expected);
+    expect(ui.editorText).toContain("不安装、不运行程序");
+    expect(ui.setCalls).toBe(1);
+    expect(ui.editorEvents.slice(-2)).toEqual(["get", "set"]);
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(runtime.observed).toHaveLength(0);
+    expect(await readdir(runtime.cwd)).toEqual(beforeFiles);
+    sendUserMessage.mockRestore();
+  }
+});
+
+test("N-001 preserves existing input and does not fill after cancellation or missing required fields", async () => {
+  const cases: Array<{
+    steps: StarterDialogStep[];
+    editorText?: string;
+    expected?: string;
+  }> = [
+    {
+      steps: [{ value: "关闭" }],
+    },
+    {
+      steps: [{ value: "✦ 开始一个文件任务" }, { value: "创建说明" }],
+    },
+    {
+      steps: [
+        { value: "✦ 开始一个文件任务" },
+        { value: "创建说明" },
+        { value: "   " },
+      ],
+      expected: "缺少必填的文件路径",
+    },
+    {
+      steps: [
+        { value: "✦ 开始一个文件任务" },
+        { value: "创建说明" },
+        { value: "notes.md" },
+        { value: "\t  " },
+      ],
+      expected: "缺少必填的要求",
+    },
+  ];
+
+  for (const item of cases) {
+    const runtime = await createRuntime();
+    const beforeFiles = await readdir(runtime.cwd);
+    const sendUserMessage = vi.spyOn(runtime.session, "sendUserMessage");
+    const ui = installStarterUi(
+      runtime,
+      item.steps,
+      item.editorText === undefined
+        ? undefined
+        : { editorText: item.editorText },
+    );
+
+    await runStarter(runtime);
+
+    expect(ui.setCalls).toBe(0);
+    expect(ui.editorText).toBe(item.editorText ?? "");
+    if (item.expected)
+      expect(ui.notifications.at(-1)?.message).toContain(item.expected);
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(runtime.observed).toHaveLength(0);
+    expect(await readdir(runtime.cwd)).toEqual(beforeFiles);
+    sendUserMessage.mockRestore();
+  }
+
+  const existing = await createRuntime();
+  const existingFiles = await readdir(existing.cwd);
+  const existingSend = vi.spyOn(existing.session, "sendUserMessage");
+  const existingUi = installStarterUi(
+    existing,
+    [{ value: "✦ 开始一个文件任务" }],
+    { editorText: "  用户已有内容  " },
+  );
+
+  await runStarter(existing);
+
+  expect(existingUi.setCalls).toBe(0);
+  expect(existingUi.editorText).toBe("  用户已有内容  ");
+  expect(existingUi.notifications.at(-1)?.message).toContain("已有内容");
+  expect(existingSend).not.toHaveBeenCalled();
+  expect(existing.observed).toHaveLength(0);
+  expect(await readdir(existing.cwd)).toEqual(existingFiles);
+  existingSend.mockRestore();
+});
+
+test("N-001 rejects busy, changed, stale, ambiguous, secret, control, and oversized starter flows", async () => {
+  const busy = await createRuntime({ bindUI: true });
+  const busyFiles = await readdir(busy.cwd);
+  const busySend = vi.spyOn(busy.session, "sendUserMessage");
+  const busyUi = installStarterUi(busy, [{ value: "✦ 开始一个文件任务" }]);
+  const runner = busy.session.extensionRunner as unknown as {
+    isIdleFn: () => boolean;
+  };
+  const previousIdle = runner.isIdleFn;
+  runner.isIdleFn = () => false;
+
+  await runStarter(busy);
+
+  expect(busyUi.setCalls).toBe(0);
+  expect(busyUi.notifications.length).toBeGreaterThan(0);
+  expect(busySend).not.toHaveBeenCalled();
+  expect(busy.observed).toHaveLength(0);
+  expect(await readdir(busy.cwd)).toEqual(busyFiles);
+  runner.isIdleFn = previousIdle;
+  busySend.mockRestore();
+
+  const duringInput = await createRuntime();
+  const duringInputFiles = await readdir(duringInput.cwd);
+  const duringInputSend = vi.spyOn(duringInput.session, "sendUserMessage");
+  const duringInputUi = installStarterUi(duringInput, [
+    { value: "✦ 开始一个文件任务" },
+    { value: "创建说明" },
+    { value: "notes.md" },
+    {
+      value: "写一份说明",
+      onOpen: ({ setEditorText }) => setEditorText("用户期间输入"),
+    },
+  ]);
+
+  await runStarter(duringInput);
+
+  expect(duringInputUi.setCalls).toBe(0);
+  expect(duringInputUi.editorText).toBe("用户期间输入");
+  expect(duringInputUi.notifications.at(-1)?.message).toContain(
+    "引导期间发生变化",
+  );
+  expect(duringInputSend).not.toHaveBeenCalled();
+  expect(duringInput.observed).toHaveLength(0);
+  expect(await readdir(duringInput.cwd)).toEqual(duringInputFiles);
+  duringInputSend.mockRestore();
+
+  const stale = await createRuntime();
+  const staleFiles = await readdir(stale.cwd);
+  const staleSend = vi.spyOn(stale.session, "sendUserMessage");
+  const staleUi = installStarterUi(stale, [
+    { value: "✦ 开始一个文件任务" },
+    {
+      value: "创建说明",
+      onOpen: () =>
+        stale.session.extensionRunner.emit({
+          type: "session_start",
+          reason: "reload",
+        }),
+    },
+  ]);
+
+  await runStarter(stale);
+
+  expect(staleUi.setCalls).toBe(0);
+  expect(staleUi.notifications.at(-1)?.message).toContain("任务或文件夹已变化");
+  expect(staleSend).not.toHaveBeenCalled();
+  expect(stale.observed).toHaveLength(0);
+  expect(await readdir(stale.cwd)).toEqual(staleFiles);
+  staleSend.mockRestore();
+
+  const running = await createRuntime();
+  const runningFiles = await readdir(running.cwd);
+  const runningSend = vi.spyOn(running.session, "sendUserMessage");
+  const runningUi = installStarterUi(running, [
+    { value: "✦ 开始一个文件任务" },
+    {
+      value: "创建说明",
+      onOpen: async () => {
+        await running.session.extensionRunner.emitBeforeAgentStart(
+          "新的真实任务",
+          undefined,
+          "system",
+          { cwd: running.cwd },
+        );
+      },
+    },
+  ]);
+
+  await runStarter(running);
+
+  expect(runningUi.setCalls).toBe(0);
+  expect(runningUi.notifications.at(-1)?.message).toContain(
+    "任务或文件夹已变化",
+  );
+  expect(runningSend).not.toHaveBeenCalled();
+  expect(running.observed).toHaveLength(0);
+  expect(await readdir(running.cwd)).toEqual(runningFiles);
+  runningSend.mockRestore();
+
+  const cwdChanged = await createRuntime();
+  const cwdChangedFiles = await readdir(cwdChanged.cwd);
+  const cwdChangedSend = vi.spyOn(cwdChanged.session, "sendUserMessage");
+  const cwdChangedUi = installStarterUi(cwdChanged, [
+    { value: "✦ 开始一个文件任务" },
+    { value: "创建说明" },
+    { value: "notes.md" },
+    {
+      value: "写一份说明",
+      onOpen: ({ setCwd }) => setCwd(join(cwdChanged.cwd, "changed-cwd")),
+    },
+  ]);
+
+  await runStarter(cwdChanged);
+
+  expect(cwdChangedUi.setCalls).toBe(0);
+  expect(cwdChangedUi.notifications.at(-1)?.message).toContain(
+    "任务或文件夹已变化",
+  );
+  expect(cwdChangedSend).not.toHaveBeenCalled();
+  expect(cwdChanged.observed).toHaveLength(0);
+  expect(await readdir(cwdChanged.cwd)).toEqual(cwdChangedFiles);
+  cwdChangedSend.mockRestore();
+
+  for (const invalidPath of [
+    "../notes.md",
+    "C:\\notes.md",
+    "notes/password=synthetic-secret.md",
+  ]) {
+    const runtime = await createRuntime();
+    const beforeFiles = await readdir(runtime.cwd);
+    const sendUserMessage = vi.spyOn(runtime.session, "sendUserMessage");
+    const ui = installStarterUi(runtime, [
+      { value: "✦ 开始一个文件任务" },
+      { value: "创建说明" },
+      { value: invalidPath },
+    ]);
+
+    await runStarter(runtime);
+
+    expect(ui.setCalls).toBe(0);
+    expect(ui.notifications.at(-1)?.message).toContain("没有修改文件或输入框");
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(runtime.observed).toHaveLength(0);
+    expect(await readdir(runtime.cwd)).toEqual(beforeFiles);
+    sendUserMessage.mockRestore();
+  }
+
+  const secretAndControl = await createRuntime();
+  const secretFiles = await readdir(secretAndControl.cwd);
+  const secretSend = vi.spyOn(secretAndControl.session, "sendUserMessage");
+  const secretUi = installStarterUi(secretAndControl, [
+    { value: "✦ 开始一个文件任务" },
+    { value: "润色文案" },
+    { value: "copy.md" },
+    { value: "password=synthetic-secret\u001b[31m语气清晰" },
+    { value: "保留日期" },
+  ]);
+
+  await runStarter(secretAndControl);
+
+  expect(secretUi.setCalls).toBe(1);
+  expect(secretUi.editorText).not.toContain("synthetic-secret");
+  expect(secretUi.editorText).not.toContain("\u001b");
+  expect(secretUi.editorText).not.toContain("[31m");
+  expect(secretUi.notifications.at(-1)?.message).toContain("安全隐藏或过滤");
+  expect(secretSend).not.toHaveBeenCalled();
+  expect(secretAndControl.observed).toHaveLength(0);
+  expect(await readdir(secretAndControl.cwd)).toEqual(secretFiles);
+  secretSend.mockRestore();
+
+  const oversizedFlows: StarterDialogStep[][] = [
+    [
+      { value: "✦ 开始一个文件任务" },
+      { value: "创建说明" },
+      { value: "notes.md" },
+      { value: "x".repeat(4097) },
+    ],
+    [
+      { value: "✦ 开始一个文件任务" },
+      { value: "润色文案" },
+      { value: "notes.md" },
+      { value: "x".repeat(4096) },
+      { value: "x".repeat(4096) },
+    ],
+  ];
+  for (const steps of oversizedFlows) {
+    const runtime = await createRuntime();
+    const beforeFiles = await readdir(runtime.cwd);
+    const sendUserMessage = vi.spyOn(runtime.session, "sendUserMessage");
+    const ui = installStarterUi(runtime, steps);
+
+    await runStarter(runtime);
+
+    expect(ui.setCalls).toBe(0);
+    expect(ui.notifications.at(-1)?.message).toContain("无法生成安全请求");
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(runtime.observed).toHaveLength(0);
+    expect(await readdir(runtime.cwd)).toEqual(beforeFiles);
+    sendUserMessage.mockRestore();
+  }
+
+  const redactionFailure = await createRuntime();
+  const redactionFiles = await readdir(redactionFailure.cwd);
+  const redactionSend = vi.spyOn(redactionFailure.session, "sendUserMessage");
+  const redactionUi = installStarterUi(redactionFailure, [
+    { value: "✦ 开始一个文件任务" },
+    { value: "创建说明" },
+    { value: "notes.md" },
+    { value: "写一份说明" },
+  ]);
+  const redactionSpy = vi
+    .spyOn(inputBoundary, "redactDisplayString")
+    .mockImplementation(() => {
+      throw new Error("synthetic redaction failure");
+    });
+
+  try {
+    await runStarter(redactionFailure);
+  } finally {
+    redactionSpy.mockRestore();
+  }
+
+  expect(redactionUi.setCalls).toBe(0);
+  expect(redactionUi.notifications.at(-1)?.message).toContain(
+    "无法生成安全请求",
+  );
+  expect(redactionSend).not.toHaveBeenCalled();
+  expect(redactionFailure.observed).toHaveLength(0);
+  expect(await readdir(redactionFailure.cwd)).toEqual(redactionFiles);
+  redactionSend.mockRestore();
+});
+
+test("N-001 reports UI read/write failures without retrying or clearing the editor", async () => {
+  const noUi = await createRuntime();
+  const noUiFiles = await readdir(noUi.cwd);
+  const noUiSend = vi.spyOn(noUi.session, "sendUserMessage");
+
+  await noUi.session.prompt("/agentglass start");
+
+  expect(noUiSend).not.toHaveBeenCalled();
+  expect(noUi.observed).toHaveLength(0);
+  expect(await readdir(noUi.cwd)).toEqual(noUiFiles);
+  noUiSend.mockRestore();
+
+  const menuFailure = await createRuntime({ bindUI: true });
+  const menuFiles = await readdir(menuFailure.cwd);
+  const menuSend = vi.spyOn(menuFailure.session, "sendUserMessage");
+  const menuUi = installStarterUi(menuFailure, [{ error: true }]);
+
+  await runStarter(menuFailure);
+
+  expect(menuUi.setCalls).toBe(0);
+  expect(menuUi.notifications.at(-1)?.message).toContain("AgentGlass 菜单");
+  expect(menuSend).not.toHaveBeenCalled();
+  expect(menuFailure.observed).toHaveLength(0);
+  expect(await readdir(menuFailure.cwd)).toEqual(menuFiles);
+  menuSend.mockRestore();
+
+  const readFailure = await createRuntime();
+  const readFiles = await readdir(readFailure.cwd);
+  const readSend = vi.spyOn(readFailure.session, "sendUserMessage");
+  const readUi = installStarterUi(
+    readFailure,
+    [{ value: "✦ 开始一个文件任务" }],
+    { getEditorTextError: true },
+  );
+
+  await runStarter(readFailure);
+
+  expect(readUi.setCalls).toBe(0);
+  expect(readUi.notifications.at(-1)?.message).toContain(
+    "无法确认请求是否填入",
+  );
+  expect(readSend).not.toHaveBeenCalled();
+  expect(readFailure.observed).toHaveLength(0);
+  expect(await readdir(readFailure.cwd)).toEqual(readFiles);
+  readSend.mockRestore();
+
+  const finalReadFailure = await createRuntime();
+  const finalReadFiles = await readdir(finalReadFailure.cwd);
+  const finalReadSend = vi.spyOn(finalReadFailure.session, "sendUserMessage");
+  const finalReadUi = installStarterUi(
+    finalReadFailure,
+    [
+      { value: "✦ 开始一个文件任务" },
+      { value: "创建说明" },
+      { value: "notes.md" },
+      { value: "写一份说明" },
+    ],
+    { getEditorTextErrorAt: 5 },
+  );
+
+  await runStarter(finalReadFailure);
+
+  expect(finalReadUi.setCalls).toBe(0);
+  expect(finalReadUi.getEditorTextCalls).toBe(5);
+  expect(finalReadUi.editorEvents.slice(-1)).toEqual(["get"]);
+  expect(finalReadUi.notifications.at(-1)?.message).toContain(
+    "无法确认请求是否填入",
+  );
+  expect(finalReadSend).not.toHaveBeenCalled();
+  expect(finalReadFailure.observed).toHaveLength(0);
+  expect(await readdir(finalReadFailure.cwd)).toEqual(finalReadFiles);
+  finalReadSend.mockRestore();
+
+  const writeFailure = await createRuntime();
+  const writeFiles = await readdir(writeFailure.cwd);
+  const writeSend = vi.spyOn(writeFailure.session, "sendUserMessage");
+  const writeUi = installStarterUi(
+    writeFailure,
+    [
+      { value: "✦ 开始一个文件任务" },
+      { value: "创建说明" },
+      { value: "notes.md" },
+      { value: "写一份说明" },
+    ],
+    { setEditorTextError: true },
+  );
+
+  await runStarter(writeFailure);
+
+  expect(writeUi.setCalls).toBe(1);
+  expect(writeUi.editorText).toBe("");
+  expect(writeUi.editorEvents.slice(-2)).toEqual(["get", "set"]);
+  expect(writeUi.notifications.at(-1)?.message).toContain(
+    "无法确认请求是否填入",
+  );
+  expect(writeSend).not.toHaveBeenCalled();
+  expect(writeFailure.observed).toHaveLength(0);
+  expect(await readdir(writeFailure.cwd)).toEqual(writeFiles);
+  writeSend.mockRestore();
 });

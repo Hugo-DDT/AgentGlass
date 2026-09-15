@@ -2104,3 +2104,76 @@ node --expose-gc tests/performance/r003-performance.mjs --package-root C:\Users\
 - 代码回到 `0.8.0` 只表示发布基线回退，不表示恢复旧授权、恢复用户文件或撤销已经发生的外部效果。
 
 本次计划变更本身没有新的运行时检查；恢复后的工程检查结果以本轮完成报告记录为准，未执行的 Pi Web、远端 CI 和 Human Validation 保持 `NOT_RUN`。
+
+## 44. 新手任务引导规划基线（2026-09-15，文档任务）
+
+用户选择 A＋C＋D：常用任务起步器、卡住后的处理入口、结果后的下一步菜单；确认通用文本三项及“填入空输入框，由用户自行发送”。本轮仅修改规范和四轮可复制 prompt，没有实现功能。正式任务源为 development-plan §9，N-001～N-004 当前均 NOT_STARTED；Pi Web 继续暂缓。
+
+### 44.1 本地来源与证据边界
+
+- 实际 HEAD：`d8aff3d1a952c0b23659985d1728091fd19aba32`；package.json 版本 `0.8.0`，开发依赖 Pi coding-agent/pi-tui `0.85.1`，peer `>=0.84.3 <=0.85.1`。本次未升级或安装依赖。
+- 源码核对：src/adapter/pi/adapter.ts 已有 /agentglass 帮助/示例/恢复/清理、latestResult 和原卡更新；src/core/outcome-card.ts 已有结构结果渲染与固定风险解释。新功能应复用这些路径，不重新构建核验或恢复。
+- 已安装 Pi 0.85.1 的 dist/core/extensions/types.d.ts 声明 ui.select/input、getEditorText/setEditorText 和 context.isIdle；dist/modes/interactive/interactive-mode.js 将 setEditorText 映射到 editor.setText，将 getEditorText 映射到 getExpandedText/getText。这是 SOURCE_CHECKED，未实测编辑器的生命周期、异常或自动提交行为；N-001 必须补真实合约验证，N-004 复验支持下限。
+- 工作树原有两张未跟踪图片 src/docs/AgentGlass_GitHub_Banner.jpg、src/docs/ChatGPT Image 2026年9月11日 19_21_24.png 保持不变。git check-ignore 确认本轮 AGENTS.md 和新建 novice-codex-prompts.md 被忽略；已直接检查，不改变 ignore 或 force-add。其余本轮规范修改可由 Git diff 查看。
+
+### 44.2 设计决定与本轮范围
+
+四轮依赖为 N-001 → N-002 → N-003 → N-004，每轮必需门通过并评审后再分配下一轮。本次完成阶段规格，不另设一轮重复文档立项。数据契约唯一置于 architecture §13；新增上下文最多一项，目标必须可安全精确表示；请求不自动发送，不授予执行/恢复权限。结果与恢复分别关联，存在竞态即结束旧选择；无新增持久化或运行时依赖。
+
+本轮文件：AGENTS.md、docs/development-plan.md、docs/architecture.md、docs/product-spec.md、docs/outcome-card-spec.md、docs/security-invariants.md、docs/threat-model.md、docs/references.md；新增 docs/novice-codex-prompts.md。不修改 README、package/lockfile、src、extensions 或测试。
+
+### 44.3 本轮文档检查
+
+执行 git rev-parse HEAD、git status --short、git diff --name-only、git check-ignore，并用 Get-Content/rg 读取上述源码、规范和锁定宿主声明。完成直接文件检查：N-001～N-004 的唯一 Done Definition 与四个完整 prompt 一一对应、引用文件/章节存在、Markdown fence 成对、状态仍未实施；范围审查确认仅上述规范与手册变化。git diff --check 用于已跟踪文档的空白检查；被忽略文件另直接检查。
+
+本次为文档任务：runtime typecheck/lint/build、unit/corpus/security/integration/e2e、真实 Pi/TUI、性能与制品门均 NOT_RUN；安全检查仅为规范/任务/类型边界的一致性审查，不是新功能安全测试 PASS。Human Validation、远端 CI 与新版本发布均 NOT_RUN。下一可分配任务为 N-001，本轮不自动开始。
+
+文档检查实际结果：内联 PowerShell 断言验证四个唯一 Done Definition、四个完整独立 prompt、各段必需检查/停止要求、引用文件与章节及仅文档变更范围，最终退出码 0；`git diff --check` 退出码 0。首次全文件空白断言命中 AGENTS.md 既有 Markdown 双空格换行，退出码 1；保留原文，改为只检查本轮新增段落与新手册后通过。没有将这次检查器范围修正写成运行时代码修复。最终 Git 可见为 7 份规范文档修改，另有直接验证的 1 份 ignored AGENTS 修改及 1 份 ignored 新手册；原有两张图片未改变。
+
+## 45. N-001 常用任务起步器实际任务证据（2026-09-15）
+
+本节记录本次明确分配的 N-001，不改变已发布 `@hugo-ddt/agentglass@0.8.0`、不重启 Pi Web，也不把本地未发布代码写成 npm 能力。执行环境为 Windows，Node `v24.14.0`、npm `11.9.0`；当前 HEAD `d8aff3d1a952c0b23659985d1728091fd19aba32`；锁定 `@earendil-works/pi-coding-agent@0.85.1` 与 `@earendil-works/pi-tui@0.85.1`，package.json/package-lock.json 未修改，未增加运行时依赖或扩 peer。
+
+### 45.1 实现与边界
+
+- 在既有 `src/adapter/pi/adapter.ts` 的 `/agentglass` 中加入“开始一个文件任务”菜单及创建说明、润色文案、整理文本三项；按 outcome-card-spec §9.1 收集文件、要求、可选保留内容，生成固定本地中文普通文字草稿。
+- 一个共用填入路径只接受 TUI、hasUI、真实 session/cwd、空闲和空编辑器；路径只做项目相对、无空段/`.`/`..`、非盘符/绝对路径的格式检查，不查存在性、不扫描目录、不创建文件夹。路径 1024 UTF-8 bytes、每字段 4096 bytes、草稿 8192 bytes，超限拒绝不截断。
+- 自由文本仅在当前调用栈短暂处理，按脱敏→完整终端序列过滤→残余控制符过滤→再脱敏后进入草稿；路径被投影改变则拒绝。草稿明确是用户检查后自行发送的请求，不是批准；没有 sendUserMessage/sendMessage/Enter 或任何文件工具调用。
+- 每次异步菜单/输入返回后及最终填入前检查 session/cwd、引导代次、TUI、hasUI、空闲和编辑器空值；最终 `getEditorText()` 与 `setEditorText()` 为同步相邻调用。已有内容（含空白）、期间新增输入、生命周期失效、取消、缺字段和读写异常均不覆盖、不清空、不自动重试。
+
+### 45.2 锁定 Pi 合约、测试与命令证据
+
+真实 Pi 集成使用锁定的 `@earendil-works/pi-coding-agent@0.85.1` `DefaultResourceLoader/createAgentSession`、实际 extension runner 和 `/agentglass` command。新增合约测试直接实例化锁定的 `InteractiveMode`，调用其真实 `createExtensionUIContext()` 取得 `ExtensionUIContext`，验证 `setEditorText/getEditorText` 映射到实际编辑器且不会触发提交；另保留锁定 `@earendil-works/pi-tui@0.85.1` `Editor` 的底层同步行为测试。引导流程的对话 UI 仍是受控测试 UI，不冒充人工真实终端；没有真实参与者记录。
+
+| 命令 | 退出码 | 实际结果 |
+|---|---:|---|
+| `npm run typecheck` | 0 | `tsc --noEmit` 通过 |
+| `npm run lint` | 0 | Biome 检查 45 files，无 error |
+| `npm run build` | 0 | `tsc -p tsconfig.build.json` 通过 |
+| `npm run test:unit` | 0 | 8 files / 65 tests PASS |
+| `npm run test:security` | 0 | 9 files / 65 tests PASS |
+| `npm run test:integration` | 0 | 2 files / 33 tests PASS；含 N-001 真实 InteractiveMode 合约与 P2 边界测试 |
+
+N-001 测试实际覆盖三类成功草稿、锁定 `Editor` 与 `InteractiveMode` 不自动提交、关闭/取消、必填空值、已有空白输入、输入期间新增内容、忙碌、session_start/before_agent_start/cwd 生命周期失效、无 UI、菜单/UI 异常、初始与最终 getEditorText 异常、setEditorText 异常、脱敏异常、get/set 顺序、项目相对路径歧义、假秘密、终端控制字符、字段与草稿超限。成功场景只允许受控编辑器草稿变化；测试断言 `sendUserMessage` 未调用、AgentGlass observed tool calls 为 0、临时项目文件列表未改变。假秘密使用合成值，无真实秘密写入测试或证据。
+
+### 45.3 Done Definition 与适用安全映射
+
+| development-plan §9.3 条目 | 实际状态 | 证据/限制 |
+|---|---|---|
+| 1. 菜单、三类引导、字段收集、取消/空值、边界、不扫描/不建目录 | PASS（本地任务证据） | 见 §45.1、integration 32/32；待用户评审 |
+| 2. 三个固定中文普通请求，无 shell/自动发送/批准，实际调用仍走原链路 | PASS（本地任务证据） | 草稿只填输入框；未执行文件工具；0.8.0 对外能力声明未改 |
+| 3. 共用填入、TUI/session/cwd/idle/空编辑器、代次与最终同步读写、竞态保护 | PASS（本地任务证据） | 真实锁定 InteractiveMode 的 ExtensionUIContext 映射测试 + runner 状态测试；受控 UI，不宣称抵抗恶意共存扩展 |
+| 4. 缺能力/取消/异常/读失败/超限/投影改变不写入，写失败不重试/清空/发送 | PASS（本地任务证据） | 无 UI、UI/get/set 异常、路径/输入失败和超限均有断言 |
+| 5. 锁定 Pi 合约、集成矩阵、零工具/文件改动；适用 INV 映射 | PASS（本地任务证据） | InteractiveMode 真实 `createExtensionUIContext()` + pi-tui Editor 运行时检查；引导矩阵与 P2 失败路径通过；真实人工 TUI/Human Validation 未运行 |
+| 6. 工程门、实际版本/命令/证据、无最近上下文/C/D 菜单、下一任务 N-002 | PASS（本地任务证据） | 六项命令退出 0；未建立 N-002/N-003/N-004 功能；下一可分配任务为 N-002 |
+
+适用增量映射：`INV-003` 由 UI/状态/投影/写入失败 fail-closed 覆盖；`INV-005`/`INV-016` 由自由文本短暂处理、秘密/控制字符投影和不进入 AgentGlass 日志、异常、持久化、工具参数或额外模型调用的测试边界覆盖；用户自行发送后仍是正常 Pi 对话。`INV-008`/`INV-012` 由引导代次、输入改变、生命周期失效、无 UI 不视为同意覆盖；`INV-015` 由 Pi 依赖仍只在 `src/adapter/pi/`/`extensions/` 使用覆盖；`INV-019` 由固定 UI 文案不作为安全策略、草稿不作为批准覆盖；`INV-020` 由精确项目相对路径格式、无扫描/无 mkdir 和实际工具链保持独立覆盖。未改变 risk/classification，故 `npm run test:corpus` 为 NOT_RUN；未影响真实工具调度，`npm run test:e2e` 为 NOT_RUN。
+
+当前 Human Validation=`NOT_RUN`（没有真人测试记录）；真实交互式终端/人工发送=`NOT_RUN`。本次未修改 `.gitignore`、README、包版本、lockfile、全局配置，未 commit/push/tag/PR/发布。历史 references §44 的“仅文档、N-001 NOT_STARTED”是前置证据，本节是其后的 N-001 实际任务记录。
+
+### 45.4 审查补测与状态修正（2026-09-15）
+
+- 针对审查发现，新增真实锁定 `InteractiveMode` 合约测试：不替换 `getEditorText/setEditorText`，直接由 `InteractiveMode.createExtensionUIContext()` 取得真实 `ExtensionUIContext`，验证编辑器读写映射和 `onSubmit` 计数为 0；另保留底层 `pi-tui Editor` 合约测试。`npx vitest run tests/integration/pi-adapter.test.ts --testTimeout=30000` 退出码 0，31 tests PASS。
+- 补齐 cwd 异步变化、最终 `getEditorText` 异常、脱敏异常、最终 get/set 顺序和共享菜单异常文案回归；失败路径均断言不写入、不发送、不调用工具、不改项目文件。
+- 重新执行最终门禁：`npm run typecheck`、`npm run lint`、`npm run build`、`npm run test:unit`（8 files / 65 tests）、`npm run test:security`（9 files / 65 tests）、`npm run test:integration`（2 files / 33 tests），全部退出码 0。`git diff --check` 退出码 0（仅 CRLF 转换提示）。
+- 因真实锁定 InteractiveMode 证据已补齐，N-001 §9.3 条目 3/5 与 security-invariants §16 的适用映射维持 `PASS（本地任务证据）`；该 PASS 不包含真实人工 TUI、人工发送或 Human Validation，三者仍为 `NOT_RUN`。

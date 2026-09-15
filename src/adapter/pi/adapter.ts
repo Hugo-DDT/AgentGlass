@@ -370,7 +370,7 @@ function welcomeLines(cwd: string): readonly string[] {
     alignedInfoLine(
       "›",
       "命令",
-      "输入 /agentglass 查看帮助、准备安全示例，或使用最近一次恢复。",
+      "输入 /agentglass 查看帮助、开始文件任务、准备安全示例或恢复最近修改。",
     ),
     alignedInfoLine(
       "!",
@@ -449,6 +449,11 @@ function helpSections(
     {
       title: "操作",
       items: [
+        {
+          marker: "›",
+          tone: "accent",
+          text: "/agentglass start  开始一个文件任务，生成可检查的中文请求草稿。",
+        },
         {
           marker: "›",
           tone: "accent",
@@ -568,6 +573,234 @@ function compactHelpLines(
     alignedInfoLine("›", "操作", "/agentglass example / restore / cleanup"),
     alignedInfoLine("·", "关闭", "Enter 或 Esc。"),
   ]);
+}
+
+const STARTER_PATH_LIMIT_BYTES = 1024;
+const STARTER_FIELD_LIMIT_BYTES = 4096;
+const STARTER_DRAFT_LIMIT_BYTES = 8192;
+const STARTER_CANCELLED = "已取消：没有修改文件或输入框。";
+const STARTER_INVALIDATED =
+  "当前任务或文件夹已变化，这次引导已结束。请重新打开入口。";
+const STARTER_INPUT_CHANGED =
+  "输入框在引导期间发生变化，这次引导已结束。请先处理现有内容后重新打开入口。";
+const MENU_UNAVAILABLE =
+  "暂时无法打开 AgentGlass 菜单。请在 Pi TUI 中重新打开 /agentglass。";
+const STARTER_UNAVAILABLE =
+  "暂时无法打开任务引导。请在 Pi TUI 中重新打开 /agentglass。";
+const STARTER_BUSY =
+  "Pi 正在处理任务，暂时不能开始引导。请等它空闲后重新打开入口。";
+const STARTER_EDITOR_UNAVAILABLE = "无法确认请求是否填入，请先查看输入框。";
+const STARTER_ESCAPE = String.fromCharCode(27);
+const STARTER_BELL = String.fromCharCode(7);
+const STARTER_CONTROL_SEQUENCE = new RegExp(
+  `(?:${STARTER_ESCAPE}\\[|${String.fromCharCode(155)})[0-?]*[ -/]*[@-~]`,
+  "gu",
+);
+const STARTER_OPERATING_SYSTEM_COMMAND = new RegExp(
+  `${STARTER_ESCAPE}\\][^${STARTER_BELL}]*(?:${STARTER_BELL}|${STARTER_ESCAPE}\\\\)`,
+  "gu",
+);
+
+type StarterTask = "create" | "polish" | "organize";
+
+interface StarterIdentity {
+  sessionId: string;
+  cwd: string;
+}
+
+interface StarterContext extends StarterIdentity {
+  generation: number;
+}
+
+interface StarterProjection {
+  text: string;
+  changed: boolean;
+}
+
+interface StarterDraftFields {
+  path: string;
+  request: string;
+  preserve: string;
+}
+
+function starterUiIsAvailable(ctx: ExtensionContext): boolean {
+  try {
+    const ui = ctx.ui as unknown as Record<string, unknown>;
+    return (
+      typeof ui.select === "function" &&
+      typeof ui.input === "function" &&
+      typeof ui.getEditorText === "function" &&
+      typeof ui.setEditorText === "function"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function starterInitialState(
+  ctx: ExtensionContext,
+): "ok" | "busy" | "unavailable" {
+  try {
+    if (
+      ctx.mode !== "tui" ||
+      !ctx.hasUI ||
+      !starterUiIsAvailable(ctx) ||
+      !nonEmptyString(ctx.sessionManager.getSessionId()) ||
+      !nonEmptyString(ctx.cwd)
+    )
+      return "unavailable";
+    return ctx.isIdle() ? "ok" : "busy";
+  } catch {
+    return "unavailable";
+  }
+}
+
+function starterIdentity(ctx: ExtensionContext): StarterIdentity | undefined {
+  try {
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (!nonEmptyString(sessionId) || !nonEmptyString(ctx.cwd))
+      return undefined;
+    return Object.freeze({ sessionId, cwd: ctx.cwd });
+  } catch {
+    return undefined;
+  }
+}
+
+function starterStateIsCurrent(
+  ctx: ExtensionContext,
+  expected: StarterContext,
+  currentGeneration: number,
+): "ok" | "busy" | "stale" | "unavailable" {
+  try {
+    if (ctx.mode !== "tui" || !ctx.hasUI || !starterUiIsAvailable(ctx))
+      return "unavailable";
+    const currentSession = ctx.sessionManager.getSessionId();
+    if (
+      !nonEmptyString(currentSession) ||
+      currentSession !== expected.sessionId ||
+      ctx.cwd !== expected.cwd ||
+      currentGeneration !== expected.generation
+    )
+      return "stale";
+    return ctx.isIdle() ? "ok" : "busy";
+  } catch {
+    return "unavailable";
+  }
+}
+
+function starterEditorState(
+  ctx: ExtensionContext,
+): "empty" | "non_empty" | "unavailable" {
+  try {
+    const text = ctx.ui.getEditorText();
+    if (typeof text !== "string") return "unavailable";
+    return text.length === 0 ? "empty" : "non_empty";
+  } catch {
+    return "unavailable";
+  }
+}
+
+function starterSafeText(value: string): string {
+  // 草稿是给用户检查的普通文字：先隐藏确定的秘密，再移除完整终端序列和残余控制符，
+  // 最后再次脱敏，防止控制序列拆开凭据形状。异常由调用者处理，绝不回退到 raw 文本。
+  return redactDisplayString(
+    redactDisplayString(value)
+      .replace(STARTER_OPERATING_SYSTEM_COMMAND, "")
+      .replace(STARTER_CONTROL_SEQUENCE, "")
+      .replace(/\p{Cc}/gu, ""),
+  );
+}
+
+function starterProjection(value: string): StarterProjection | undefined {
+  // 自由文本只在本次表单调用栈中短暂存在：先脱敏、再移除终端控制、再脱敏，
+  // 最后才检查字节上限。任何处理异常都返回 undefined，避免把 raw 文本带入草稿。
+  if (Buffer.byteLength(value, "utf8") > STARTER_FIELD_LIMIT_BYTES)
+    return undefined;
+  try {
+    const text = starterSafeText(value);
+    if (Buffer.byteLength(text, "utf8") > STARTER_FIELD_LIMIT_BYTES)
+      return undefined;
+    return Object.freeze({ text, changed: text !== value });
+  } catch {
+    return undefined;
+  }
+}
+
+function starterPath(value: string): string | undefined {
+  // 路径只做无歧义的相对格式检查，不查存在性、不枚举目录；真实文件身份和安全性
+  // 仍由用户发送后的 read/write/edit 完整信任链决定。脱敏或控制过滤改变路径时拒绝定向草稿。
+  if (
+    Buffer.byteLength(value, "utf8") > STARTER_PATH_LIMIT_BYTES ||
+    value.trim().length === 0
+  )
+    return undefined;
+  const normalized = value.replaceAll("\\", "/");
+  if (
+    normalized.startsWith("/") ||
+    /^[A-Za-z]:/.test(normalized) ||
+    (process.platform === "win32" && normalized.includes(":"))
+  )
+    return undefined;
+  const segments = normalized.split("/");
+  if (
+    segments.some(
+      (segment) => segment.length === 0 || segment === "." || segment === "..",
+    )
+  )
+    return undefined;
+  try {
+    const safe = starterSafeText(normalized);
+    return safe === normalized &&
+      Buffer.byteLength(safe, "utf8") <= STARTER_PATH_LIMIT_BYTES
+      ? safe
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function starterTask(choice: string | undefined): StarterTask | undefined {
+  if (choice === "创建说明") return "create";
+  if (choice === "润色文案") return "polish";
+  if (choice === "整理文本") return "organize";
+  return undefined;
+}
+
+function starterDraft(
+  task: StarterTask,
+  fields: StarterDraftFields,
+): { text: string; projectedTextChanged: boolean } | undefined {
+  const path = starterPath(fields.path);
+  const request = starterProjection(fields.request);
+  const preserve = starterProjection(fields.preserve);
+  if (!path || !request || !preserve) return undefined;
+  const preserveLine = preserve.text.trim().length
+    ? preserve.text
+    : "无特别指定。";
+  const taskLine =
+    task === "create"
+      ? "请为这个文件创建一份说明。"
+      : task === "polish"
+        ? "请先查看这个文件，再按要求润色文案。"
+        : "请先查看这个文件，再按要求整理文本结构。";
+  const missingLine =
+    task === "create"
+      ? "如果文件已经存在，请先查看并说明，不要直接覆盖；每次只提出一个文件变更。"
+      : "如果文件不存在或无法安全确认，请先说明，不要自行创建替代文件。";
+  const text = [
+    taskLine,
+    `文件：${path}`,
+    `要求：${request.text}`,
+    `保留内容：${preserveLine}`,
+    missingLine,
+    "不安装、不运行程序；任何文件修改仍需逐次确认。",
+  ].join("\n");
+  return Buffer.byteLength(text, "utf8") <= STARTER_DRAFT_LIMIT_BYTES
+    ? Object.freeze({
+        text,
+        projectedTextChanged: request.changed || preserve.changed,
+      })
+    : undefined;
 }
 
 async function showHelpOverlay(
@@ -1283,6 +1516,7 @@ export function registerPiAdapter(
   let latestResult: readonly string[] | undefined;
   let welcomedCwd: string | undefined;
   let runGeneration = 0;
+  let starterGeneration = 0;
 
   const clearRun = (ctx?: ExtensionContext): void => {
     if (ctx) {
@@ -1305,6 +1539,7 @@ export function registerPiAdapter(
     pendingReads.clear();
     activeExecutions.clear();
     runGeneration += 1;
+    starterGeneration += 1;
     userGoal = Object.freeze({ status: "unknown" });
   };
 
@@ -1408,6 +1643,207 @@ export function registerPiAdapter(
     } catch {
       // UI 失败不改变恢复或清理状态，也不回显异常。
     }
+  };
+
+  const startFileTask = async (ctx: ExtensionContext): Promise<void> => {
+    const initialState = starterInitialState(ctx);
+    if (initialState === "busy") {
+      notify(ctx, STARTER_BUSY, "warning");
+      return;
+    }
+    if (initialState !== "ok") {
+      notify(ctx, STARTER_UNAVAILABLE, "warning");
+      return;
+    }
+    const initialEditor = starterEditorState(ctx);
+    if (initialEditor === "non_empty") {
+      notify(
+        ctx,
+        "输入框已有内容，已保留。请先自行发送或清空，再打开这个入口。",
+        "warning",
+      );
+      return;
+    }
+    if (initialEditor !== "empty") {
+      notify(ctx, STARTER_EDITOR_UNAVAILABLE, "warning");
+      return;
+    }
+    const identity = starterIdentity(ctx);
+    if (!identity) {
+      notify(ctx, STARTER_UNAVAILABLE, "warning");
+      return;
+    }
+
+    // 代次只存在内存中：另一轮引导、agent_end、session_start 或 shutdown 都会使
+    // 旧流程失效。每次 await 后重新核对宿主身份和空闲状态，不能把草稿写进新会话。
+    const expected = Object.freeze({
+      ...identity,
+      generation: ++starterGeneration,
+    });
+    const afterAwait = (): boolean => {
+      const state = starterStateIsCurrent(ctx, expected, starterGeneration);
+      if (state === "busy") {
+        notify(ctx, STARTER_BUSY, "warning");
+        return false;
+      }
+      if (state === "stale") {
+        notify(ctx, STARTER_INVALIDATED, "warning");
+        return false;
+      }
+      if (state !== "ok") {
+        notify(ctx, STARTER_UNAVAILABLE, "warning");
+        return false;
+      }
+      const editor = starterEditorState(ctx);
+      if (editor === "non_empty") {
+        notify(ctx, STARTER_INPUT_CHANGED, "warning");
+        return false;
+      }
+      if (editor !== "empty") {
+        notify(ctx, STARTER_EDITOR_UNAVAILABLE, "warning");
+        return false;
+      }
+      return true;
+    };
+    const readInput = async (
+      title: string,
+      placeholder: string,
+    ): Promise<string | null | undefined> => {
+      try {
+        const value = await ctx.ui.input(title, placeholder);
+        if (value !== undefined && typeof value !== "string") {
+          notify(ctx, STARTER_UNAVAILABLE, "warning");
+          return null;
+        }
+        return value;
+      } catch {
+        notify(ctx, STARTER_UNAVAILABLE, "warning");
+        return null;
+      }
+    };
+
+    let selected: string | undefined;
+    try {
+      selected = await ctx.ui.select("开始一个文件任务", [
+        "创建说明",
+        "润色文案",
+        "整理文本",
+        "关闭",
+      ]);
+    } catch {
+      notify(ctx, STARTER_UNAVAILABLE, "warning");
+      return;
+    }
+    if (!afterAwait()) return;
+    const task = starterTask(selected);
+    if (!task) {
+      notify(ctx, STARTER_CANCELLED);
+      return;
+    }
+
+    const pathValue = await readInput(
+      "文件路径（项目相对路径）",
+      "例如 docs/activity.md",
+    );
+    if (pathValue === null) return;
+    if (pathValue === undefined) {
+      notify(ctx, STARTER_CANCELLED);
+      return;
+    }
+    if (!afterAwait()) return;
+    if (pathValue.trim().length === 0) {
+      notify(ctx, "已结束：缺少必填的文件路径，没有修改文件或输入框。");
+      return;
+    }
+
+    const requestTitle =
+      task === "create"
+        ? "主题与要求（必填）"
+        : task === "polish"
+          ? "调整风格与要求（必填）"
+          : "希望的结构与要求（必填）";
+    const requestValue = await readInput(
+      requestTitle,
+      "请用普通文字描述你想要的结果",
+    );
+    if (requestValue === null) return;
+    if (requestValue === undefined) {
+      notify(ctx, STARTER_CANCELLED);
+      return;
+    }
+    if (!afterAwait()) return;
+    if (requestValue.trim().length === 0) {
+      notify(ctx, "已结束：缺少必填的要求，没有修改文件或输入框。");
+      return;
+    }
+
+    let preserveValue = "";
+    if (task !== "create") {
+      const value = await readInput(
+        "必须保留的内容（可留空）",
+        "没有特别要求可以直接确认留空",
+      );
+      if (value === null) return;
+      if (value === undefined) {
+        notify(ctx, STARTER_CANCELLED);
+        return;
+      }
+      if (!afterAwait()) return;
+      preserveValue = value;
+    }
+
+    const draft = starterDraft(task, {
+      path: pathValue,
+      request: requestValue,
+      preserve: preserveValue,
+    });
+    if (!draft) {
+      notify(
+        ctx,
+        "无法生成安全请求：请使用明确的项目相对路径和较短的普通文字后重新打开入口。没有修改文件或输入框。",
+        "warning",
+      );
+      return;
+    }
+
+    const finalState = starterStateIsCurrent(ctx, expected, starterGeneration);
+    if (finalState === "busy") {
+      notify(ctx, STARTER_BUSY, "warning");
+      return;
+    }
+    if (finalState === "stale") {
+      notify(ctx, STARTER_INVALIDATED, "warning");
+      return;
+    }
+    if (finalState !== "ok") {
+      notify(ctx, STARTER_UNAVAILABLE, "warning");
+      return;
+    }
+
+    // 这是唯一填入点：所有异步检查完成后，同步读取并立即写入，中间没有 await。
+    // 非空（包括空白）绝不覆盖；setEditorText 异常时不清空、不重试，也不声称已发送。
+    try {
+      const editor = ctx.ui.getEditorText();
+      if (typeof editor !== "string") throw new Error();
+      if (editor.length !== 0) {
+        notify(
+          ctx,
+          "输入框已有内容，已保留。请先自行发送或清空，再打开这个入口。",
+          "warning",
+        );
+        return;
+      }
+      ctx.ui.setEditorText(draft.text);
+    } catch {
+      notify(ctx, STARTER_EDITOR_UNAVAILABLE, "warning");
+      return;
+    }
+    notify(
+      ctx,
+      draft.projectedTextChanged
+        ? "已填入请求，其中部分文字已安全隐藏或过滤，请检查草稿后自行发送。文件修改仍需你的确认。"
+        : "已填入请求，请检查后自行发送。文件修改仍需你的确认。",
+    );
   };
 
   const rememberResult = (lines: readonly string[]): void => {
@@ -1669,22 +2105,32 @@ export function registerPiAdapter(
       if (!action) {
         const menuOptions = [
           "› 查看欢迎与帮助",
+          "✦ 开始一个文件任务",
           "✦ 准备安全示例",
           ...(menuHasRecovery ? ["↶ 恢复最近一次修改"] : []),
           "× 清理本地恢复数据",
           "关闭",
         ];
-        const choice = await ctx.ui.select("🛡 AgentGlass", menuOptions);
+        let choice: string | undefined;
+        try {
+          choice = await ctx.ui.select("🛡 AgentGlass", menuOptions);
+        } catch {
+          notify(ctx, MENU_UNAVAILABLE, "warning");
+          return;
+        }
+        const recoveryChoice = menuHasRecovery ? menuOptions[3] : undefined;
         action =
           choice === menuOptions[0]
             ? "help"
             : choice === menuOptions[1]
-              ? "example"
-              : menuHasRecovery && choice === menuOptions[2]
-                ? "restore"
-                : choice === menuOptions[menuOptions.length - 2]
-                  ? "cleanup"
-                  : "";
+              ? "start"
+              : choice === menuOptions[2]
+                ? "example"
+                : recoveryChoice && choice === recoveryChoice
+                  ? "restore"
+                  : choice === menuOptions[menuOptions.length - 2]
+                    ? "cleanup"
+                    : "";
       }
       if (
         action === "help" ||
@@ -1693,6 +2139,15 @@ export function registerPiAdapter(
         action === "欢迎"
       ) {
         await showHelp(ctx);
+        return;
+      }
+      if (
+        action === "start" ||
+        action === "任务" ||
+        action === "开始任务" ||
+        action === "开始一个文件任务"
+      ) {
+        await startFileTask(ctx);
         return;
       }
       if (
@@ -1909,7 +2364,7 @@ export function registerPiAdapter(
       if (action)
         notify(
           ctx,
-          "可用操作：/agentglass help、/agentglass example、/agentglass restore 或 /agentglass cleanup。",
+          "可用操作：/agentglass help、/agentglass start、/agentglass example、/agentglass restore 或 /agentglass cleanup。",
         );
     },
   });
@@ -1935,6 +2390,9 @@ export function registerPiAdapter(
     }
   });
   pi.on("before_agent_start", (event) => {
+    // 新一轮真实 agent run 在 agent_end 之前就必须使引导失效；否则异步表单返回后
+    // 可能把旧请求写进正在运行的新任务。这里只增加内存代次，不保存 prompt 原文。
+    starterGeneration += 1;
     try {
       userGoal = nonEmptyString(event.prompt)
         ? projectObservableUserGoal(event.prompt)
