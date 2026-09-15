@@ -349,6 +349,33 @@ function installApprovalUi(
   };
 }
 
+function installGuidanceUi(runtime: E2ERuntime, choice: string, editor = "") {
+  const runner = runtime.session.extensionRunner;
+  const base = runner.getUIContext();
+  let editorText = editor;
+  const notifications: Array<{ message: string; type: string | undefined }> =
+    [];
+  runner.setUIContext(
+    {
+      ...base,
+      select: async () => choice,
+      input: async () => undefined,
+      getEditorText: () => editorText,
+      setEditorText: (text) => {
+        editorText = text;
+      },
+      notify: (message, type) => notifications.push({ message, type }),
+    },
+    "tui",
+  );
+  return {
+    notifications,
+    get editorText() {
+      return editorText;
+    },
+  };
+}
+
 async function promptCalls(
   runtime: E2ERuntime,
   calls: ToolCall[],
@@ -556,6 +583,37 @@ describe.sequential("A-016 Pi 0.85.1 real dispatch E2E", () => {
       await readdir(join(runtime.agentDir, ".agentglass", "snapshots")),
     ).toEqual([]);
     expect(ui.customCalls).toBe(4);
+  });
+
+  test("N-002 real Pi package entry fills a sequential draft without sending or executing", async () => {
+    const runtime = await createRuntime();
+    const sendUserMessage = vi.spyOn(runtime.session, "sendUserMessage");
+    const ui = installGuidanceUi(runtime, "填入：每次只改一个文件");
+    const calls: ToolCall[] = [
+      {
+        type: "toolCall",
+        id: "e2e-multi-one",
+        name: "write",
+        arguments: { path: "one.txt", content: "one" },
+      },
+      {
+        type: "toolCall",
+        id: "e2e-multi-two",
+        name: "write",
+        arguments: { path: "two.txt", content: "two" },
+      },
+    ];
+    await promptCalls(runtime, calls, "请同时修改两个普通文件");
+    const sendCount = sendUserMessage.mock.calls.length;
+    await runtime.session.prompt("/agentglass process");
+    expect(ui.editorText).toContain("每次只改一个文件");
+    expect(ui.editorText).not.toContain("one.txt");
+    expect(ui.editorText).not.toContain("two.txt");
+    expect(sendUserMessage.mock.calls.length).toBe(sendCount);
+    expect(runtime.executionEnds).toHaveLength(2);
+    expect(runtime.executionEnds.every(({ isError }) => isError)).toBe(true);
+    expect(await exists(join(runtime.cwd, "one.txt"))).toBe(false);
+    expect(await exists(join(runtime.cwd, "two.txt"))).toBe(false);
   });
 
   test("Stop stays focused; details do not approve; Continue, Stop, Esc, and cancel remain distinct", async () => {

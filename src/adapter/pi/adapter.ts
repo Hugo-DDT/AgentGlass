@@ -56,6 +56,7 @@ import {
 import type { RecoveryEntry } from "../../core/pre-image-snapshot.js";
 import { predictEffects } from "../../core/predicted-effects.js";
 import {
+  assessRisk,
   assessSiblingMutationRisk,
   requireMutationBackup,
 } from "../../core/risk-engine.js";
@@ -162,6 +163,7 @@ interface PendingVerification {
   targetPath: string;
   expected: ExpectedFilePostcondition;
   preImage: PreImageSnapshotEvidence;
+  guidanceOrder: number;
   inFlight: boolean;
 }
 
@@ -169,6 +171,7 @@ interface SessionRecoveryEntry extends RecoveryEntry {
   sessionId: string;
   cwd: string;
   targetLabel: string;
+  relativeTarget?: string;
 }
 
 interface ExamplePlan {
@@ -370,7 +373,7 @@ function welcomeLines(cwd: string): readonly string[] {
     alignedInfoLine(
       "›",
       "命令",
-      "输入 /agentglass 查看帮助、开始文件任务、准备安全示例或恢复最近修改。",
+      "输入 /agentglass 查看帮助、处理刚才的问题、开始文件任务或准备安全示例。",
     ),
     alignedInfoLine(
       "!",
@@ -453,6 +456,11 @@ function helpSections(
           marker: "›",
           tone: "accent",
           text: "/agentglass start  开始一个文件任务，生成可检查的中文请求草稿。",
+        },
+        {
+          marker: "›",
+          tone: "accent",
+          text: "/agentglass process  处理刚才的阻止、核对或恢复冲突。",
         },
         {
           marker: "›",
@@ -570,7 +578,11 @@ function compactHelpLines(
           `可恢复“${recovery.targetLabel}”；输入 /agentglass restore。`,
         )
       : alignedInfoLine("↶", "恢复", "当前没有可用的最近恢复入口。"),
-    alignedInfoLine("›", "操作", "/agentglass example / restore / cleanup"),
+    alignedInfoLine(
+      "›",
+      "操作",
+      "/agentglass process / example / restore / cleanup",
+    ),
     alignedInfoLine("·", "关闭", "Enter 或 Esc。"),
   ]);
 }
@@ -617,10 +629,42 @@ interface StarterProjection {
   changed: boolean;
 }
 
+interface GuidanceDraft {
+  text: string;
+  projectedTextChanged: boolean;
+}
+
 interface StarterDraftFields {
   path: string;
   request: string;
   preserve: string;
+}
+
+type RecentGuidanceCategory =
+  | "batch_mutation"
+  | "batch_context_unknown"
+  | "verification_matched"
+  | "verification_mismatch"
+  | "verification_unknown"
+  | "recovery_complete"
+  | "recovery_conflict"
+  | "recovery_failed"
+  | "user_cancellation"
+  | "other_result"
+  | "other_blocked";
+
+interface RecentGuidanceSeed {
+  sessionId: string;
+  cwd: string;
+  category: RecentGuidanceCategory;
+  actionId?: string;
+  effectId?: string;
+  targetId?: string;
+  relativeTarget?: string;
+}
+
+interface RecentGuidanceContext extends RecentGuidanceSeed {
+  revision: number;
 }
 
 function starterUiIsAvailable(ctx: ExtensionContext): boolean {
@@ -759,6 +803,36 @@ function starterPath(value: string): string | undefined {
   }
 }
 
+function safeRelativeGuidanceTarget(
+  cwd: string,
+  targetPath: string,
+): string | undefined {
+  try {
+    // 只把已由文件信任链确认的真实目标投影成项目相对路径；relative 会拒绝
+    // 工作区外路径，starterPath 再拒绝绝对路径、空段、控制符和脱敏后的变化。
+    return starterPath(
+      path.relative(path.resolve(cwd), path.resolve(targetPath)),
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+const sequentialGuidanceReasons = new Set([
+  "BATCH_MUTATION_BLOCKED",
+  "BATCH_CONTEXT_UNKNOWN",
+  "PREFLIGHT_FAILED",
+  "FILE_MODIFY",
+  "FILE_CREATE",
+  "KNOWN_READ_ONLY",
+]);
+
+function canOfferSequentialDraft(risk: RiskAssessment): boolean {
+  // 顺序草稿只解释 Alpha 的 sibling 门；敏感、越界、未知、完整性或不支持等
+  // 任何额外原因都不能被“每次一个文件”掩盖，必须保留更严格的固定阻止说明。
+  return risk.reasonCodes.every((code) => sequentialGuidanceReasons.has(code));
+}
+
 function starterTask(choice: string | undefined): StarterTask | undefined {
   if (choice === "创建说明") return "create";
   if (choice === "润色文案") return "polish";
@@ -769,7 +843,7 @@ function starterTask(choice: string | undefined): StarterTask | undefined {
 function starterDraft(
   task: StarterTask,
   fields: StarterDraftFields,
-): { text: string; projectedTextChanged: boolean } | undefined {
+): GuidanceDraft | undefined {
   const path = starterPath(fields.path);
   const request = starterProjection(fields.request);
   const preserve = starterProjection(fields.preserve);
@@ -1476,7 +1550,11 @@ function mapToolCall(
 async function assessMappedBatch(
   batch: readonly TransientHostExecutionInput[],
   toolCallId: string,
-): Promise<{ facts: HostExecutionFacts; risk: RiskAssessment }> {
+): Promise<{
+  facts: HostExecutionFacts;
+  risk: RiskAssessment;
+  hasStrictSiblingReason: boolean;
+}> {
   const executionInput = await loadExecutionInputModule();
   if (!executionInput) throw new Error();
   const facts = await Promise.all(
@@ -1489,6 +1567,11 @@ async function assessMappedBatch(
     risk: assessSiblingMutationRisk(
       current.action,
       facts.map((item) => item.action),
+    ),
+    hasStrictSiblingReason: facts.some((item) =>
+      assessRisk(item.action).reasonCodes.some(
+        (code) => !sequentialGuidanceReasons.has(code),
+      ),
     ),
   };
 }
@@ -1503,7 +1586,12 @@ export function registerPiAdapter(
   // pending 只保存不透明身份字符串；raw input、goal 原文和 Pi event/ctx 都不会进入此 Map。
   const activeExecutions = new Map<
     string,
-    { hostExecutionId: string; toolName: string; cwd: string }
+    {
+      hostExecutionId: string;
+      toolName: string;
+      cwd: string;
+      guidanceOrder: number;
+    }
   >();
   const pendingVerifications = new Map<string, PendingVerification>();
   const pendingReads = new Map<
@@ -1514,21 +1602,134 @@ export function registerPiAdapter(
   const pendingApprovalCancels = new Set<() => void>();
   let latestRecovery: SessionRecoveryEntry | undefined;
   let latestResult: readonly string[] | undefined;
+  let recentGuidance: RecentGuidanceContext | undefined;
+  let guidanceSequence = 0;
+  let publishedGuidanceOrder = 0;
+  let guidanceRevision = 0;
   let welcomedCwd: string | undefined;
   let runGeneration = 0;
   let starterGeneration = 0;
 
+  const currentIdentity = (
+    ctx: ExtensionContext,
+  ): StarterIdentity | undefined => starterIdentity(ctx);
+
+  const clearRecentGuidance = (): void => {
+    // 代次边界会让迟到的旧结果永远排在清理标记之前；这里只清理当前会话的
+    // 脱敏关联，不触碰 Pi 对话历史、工具输入、快照正文或用户输入框内容。
+    publishedGuidanceOrder = ++guidanceSequence;
+    recentGuidance = undefined;
+  };
+
+  const currentRecentGuidance = (
+    ctx: ExtensionContext,
+  ): RecentGuidanceContext | undefined => {
+    if (!recentGuidance) return undefined;
+    const identity = currentIdentity(ctx);
+    if (
+      !identity ||
+      identity.sessionId !== recentGuidance.sessionId ||
+      identity.cwd !== recentGuidance.cwd
+    ) {
+      clearRecentGuidance();
+      return undefined;
+    }
+    return recentGuidance;
+  };
+
+  const publishGuidance = (
+    ctx: ExtensionContext,
+    seed: RecentGuidanceSeed,
+    order: number,
+  ): boolean => {
+    const identity = currentIdentity(ctx);
+    if (
+      !identity ||
+      identity.sessionId !== seed.sessionId ||
+      identity.cwd !== seed.cwd ||
+      order < publishedGuidanceOrder
+    )
+      return false;
+    publishedGuidanceOrder = order;
+    recentGuidance = Object.freeze({
+      ...seed,
+      revision: ++guidanceRevision,
+    });
+    return true;
+  };
+
+  const publishResult = (
+    ctx: ExtensionContext,
+    lines: readonly string[],
+    seed: RecentGuidanceSeed,
+    order: number,
+  ): boolean => {
+    if (!publishGuidance(ctx, seed, order)) return false;
+    latestResult = Object.freeze([...lines]);
+    return true;
+  };
+
+  const beginGuidanceOperation = (): number => {
+    // 内部命令也必须在第一个 await 前取得启动代次；完成时沿用这次代次，
+    // 这样期间发布的新工具结果、会话边界或 cwd 清理都能拒绝迟到旧结果。
+    return ++guidanceSequence;
+  };
+
+  const actionGuidance = (
+    facts: HostExecutionFacts,
+    category: RecentGuidanceCategory,
+    effect?: PredictedEffect,
+  ): RecentGuidanceSeed => ({
+    sessionId: facts.sessionId,
+    cwd: facts.cwd,
+    category,
+    actionId: facts.action.actionId,
+    ...(effect ? { effectId: effect.effectId, targetId: effect.targetId } : {}),
+  });
+
+  const pendingGuidance = (
+    pending: PendingVerification,
+    category: RecentGuidanceCategory,
+    includeTarget: boolean,
+  ): RecentGuidanceSeed => {
+    const relativeTarget = includeTarget
+      ? safeRelativeGuidanceTarget(pending.binding.cwd, pending.targetPath)
+      : undefined;
+    const seed = {
+      sessionId: pending.binding.sessionId,
+      cwd: pending.binding.cwd,
+      category,
+      actionId: pending.action.actionId,
+      effectId: pending.effect.effectId,
+      targetId: pending.effect.targetId,
+    };
+    return relativeTarget ? { ...seed, relativeTarget } : seed;
+  };
+
+  const genericGuidance = (
+    ctx: ExtensionContext,
+    category: RecentGuidanceCategory,
+  ): RecentGuidanceSeed | undefined => {
+    const identity = currentIdentity(ctx);
+    return identity ? { ...identity, category } : undefined;
+  };
+
   const clearRun = (ctx?: ExtensionContext): void => {
+    if (ctx) currentRecentGuidance(ctx);
     if (ctx) {
       for (const pending of pendingVerifications.values()) {
-        setActionCard(
-          ctx,
-          renderOutcomeCardUpdate(
-            pending.action,
-            pending.effect,
-            unverifiableResult(pending.expected, "unknown", "RESULT_MISSING"),
-          ),
+        const resultUpdate = renderOutcomeCardUpdate(
+          pending.action,
+          pending.effect,
+          unverifiableResult(pending.expected, "unknown", "RESULT_MISSING"),
         );
+        const published = publishResult(
+          ctx,
+          resultUpdate.lines,
+          pendingGuidance(pending, "verification_unknown", true),
+          pending.guidanceOrder,
+        );
+        if (published) setActionCard(ctx, resultUpdate);
       }
     }
     for (const cancel of [...pendingApprovalCancels]) cancel();
@@ -1546,7 +1747,7 @@ export function registerPiAdapter(
   const assessCurrent = (
     event: ToolCallEvent,
     ctx: ExtensionContext,
-  ): Promise<{ facts: HostExecutionFacts; risk: RiskAssessment }> =>
+  ): Promise<Awaited<ReturnType<typeof assessMappedBatch>>> =>
     assessMappedBatch(
       mapToolCall(pi, event, ctx, sessionId, userGoal),
       event.toolCallId,
@@ -1643,6 +1844,51 @@ export function registerPiAdapter(
     } catch {
       // UI 失败不改变恢复或清理状态，也不回显异常。
     }
+  };
+
+  const fillGuidanceDraft = (
+    ctx: ExtensionContext,
+    expected: StarterContext,
+    draft: GuidanceDraft,
+  ): boolean => {
+    // 所有引导入口共用这一处最终写入：异步菜单返回后再次检查会话、cwd、引导
+    // 代次和空闲状态；get/set 紧邻执行，保留任何非空输入且绝不模拟发送。
+    const state = starterStateIsCurrent(ctx, expected, starterGeneration);
+    if (state === "busy") {
+      notify(ctx, STARTER_BUSY, "warning");
+      return false;
+    }
+    if (state === "stale") {
+      notify(ctx, STARTER_INVALIDATED, "warning");
+      return false;
+    }
+    if (state !== "ok") {
+      notify(ctx, STARTER_UNAVAILABLE, "warning");
+      return false;
+    }
+    try {
+      const editor = ctx.ui.getEditorText();
+      if (typeof editor !== "string") throw new Error();
+      if (editor.length !== 0) {
+        notify(
+          ctx,
+          "输入框已有内容，已保留。请先自行发送或清空，再打开这个入口。",
+          "warning",
+        );
+        return false;
+      }
+      ctx.ui.setEditorText(draft.text);
+    } catch {
+      notify(ctx, STARTER_EDITOR_UNAVAILABLE, "warning");
+      return false;
+    }
+    notify(
+      ctx,
+      draft.projectedTextChanged
+        ? "已填入请求，其中部分文字已安全隐藏或过滤，请检查草稿后自行发送。文件修改仍需你的确认。"
+        : "已填入请求，请检查后自行发送。文件修改仍需你的确认。",
+    );
+    return true;
   };
 
   const startFileTask = async (ctx: ExtensionContext): Promise<void> => {
@@ -1806,48 +2052,133 @@ export function registerPiAdapter(
       return;
     }
 
-    const finalState = starterStateIsCurrent(ctx, expected, starterGeneration);
-    if (finalState === "busy") {
+    fillGuidanceDraft(ctx, expected, draft);
+  };
+
+  const problemDraft = (
+    context: RecentGuidanceContext,
+  ): GuidanceDraft | undefined => {
+    if (
+      context.category === "batch_mutation" ||
+      context.category === "batch_context_unknown"
+    ) {
+      return Object.freeze({
+        text: [
+          "请让 Pi 每次只改一个文件；每次只改一个普通项目文件。",
+          "不要同时提出多个文件修改；不要安装、运行程序或使用 shell。",
+          "每一步仍需 AgentGlass 的独立检查和确认。",
+        ].join("\n"),
+        projectedTextChanged: false,
+      });
+    }
+    if (
+      context.category !== "verification_mismatch" &&
+      context.category !== "verification_unknown" &&
+      context.category !== "recovery_conflict"
+    )
+      return undefined;
+    const target = context.relativeTarget
+      ? starterPath(context.relativeTarget)
+      : undefined;
+    if (!target) return undefined;
+    return Object.freeze({
+      text: [
+        "请先查看这个普通项目文件，不要修改它。",
+        `文件：${target}`,
+        "如果无法安全确认，请说明原因；不要自行创建替代文件或重复执行刚才的动作。",
+      ].join("\n"),
+      projectedTextChanged: false,
+    });
+  };
+
+  const problemFixedMessage = (category: RecentGuidanceCategory): string => {
+    switch (category) {
+      case "user_cancellation":
+        return "你刚才选择停止，这一步没有获得执行许可。AgentGlass 不会继续这一步。";
+      case "verification_matched":
+      case "recovery_complete":
+      case "other_result":
+        return "刚才的结果已确认，没有需要处理的问题。AgentGlass 不会自动提出下一步。";
+      case "verification_mismatch":
+      case "verification_unknown":
+      case "recovery_conflict":
+        return "无法安全表示刚才涉及的文件，因此没有填入定向请求。请返回 Pi，明确一份普通项目文件。";
+      case "recovery_failed":
+        return "恢复结果无法确认；AgentGlass 不会自动重试恢复。请返回 Pi，明确一份普通项目文件。";
+      case "batch_mutation":
+      case "batch_context_unknown":
+        return "无法安全生成这次处理请求。请返回 Pi，明确一份普通项目文件。";
+      case "other_blocked":
+        return "刚才这一步被安全检查停止，AgentGlass 不会自动重试。请返回 Pi，明确一份普通项目文件。";
+    }
+  };
+
+  const processRecentProblem = async (ctx: ExtensionContext): Promise<void> => {
+    if (activeExecutions.size > 0) {
       notify(ctx, STARTER_BUSY, "warning");
       return;
     }
-    if (finalState === "stale") {
-      notify(ctx, STARTER_INVALIDATED, "warning");
+    const initialState = starterInitialState(ctx);
+    if (initialState === "busy") {
+      notify(ctx, STARTER_BUSY, "warning");
       return;
     }
-    if (finalState !== "ok") {
+    if (initialState !== "ok") {
       notify(ctx, STARTER_UNAVAILABLE, "warning");
       return;
     }
-
-    // 这是唯一填入点：所有异步检查完成后，同步读取并立即写入，中间没有 await。
-    // 非空（包括空白）绝不覆盖；setEditorText 异常时不清空、不重试，也不声称已发送。
-    try {
-      const editor = ctx.ui.getEditorText();
-      if (typeof editor !== "string") throw new Error();
-      if (editor.length !== 0) {
-        notify(
-          ctx,
-          "输入框已有内容，已保留。请先自行发送或清空，再打开这个入口。",
-          "warning",
-        );
-        return;
-      }
-      ctx.ui.setEditorText(draft.text);
-    } catch {
-      notify(ctx, STARTER_EDITOR_UNAVAILABLE, "warning");
+    const context = currentRecentGuidance(ctx);
+    if (!context) {
+      notify(
+        ctx,
+        "当前没有可处理的最近问题。请返回 Pi，明确一份普通项目文件。",
+      );
       return;
     }
-    notify(
-      ctx,
-      draft.projectedTextChanged
-        ? "已填入请求，其中部分文字已安全隐藏或过滤，请检查草稿后自行发送。文件修改仍需你的确认。"
-        : "已填入请求，请检查后自行发送。文件修改仍需你的确认。",
-    );
-  };
-
-  const rememberResult = (lines: readonly string[]): void => {
-    latestResult = Object.freeze([...lines]);
+    const draft = problemDraft(context);
+    if (!draft) {
+      notify(ctx, problemFixedMessage(context.category), "warning");
+      return;
+    }
+    const identity = starterIdentity(ctx);
+    if (!identity) {
+      notify(ctx, STARTER_UNAVAILABLE, "warning");
+      return;
+    }
+    // 这是处理菜单自己的短暂代次；菜单等待期间若有新结果、session/cwd 切换或
+    // agent 重新运行，旧上下文就不再是“刚才的问题”，不能把草稿填入新任务。
+    const expected = Object.freeze({
+      ...identity,
+      generation: ++starterGeneration,
+    });
+    const choiceLabel =
+      context.category === "batch_mutation" ||
+      context.category === "batch_context_unknown"
+        ? "填入：每次只改一个文件"
+        : "填入：先查看这份文件";
+    let choice: string | undefined;
+    try {
+      choice = await ctx.ui.select("处理刚才的问题", ["关闭", choiceLabel]);
+    } catch {
+      notify(ctx, MENU_UNAVAILABLE, "warning");
+      return;
+    }
+    if (
+      currentRecentGuidance(ctx) !== context ||
+      starterStateIsCurrent(ctx, expected, starterGeneration) !== "ok"
+    ) {
+      notify(
+        ctx,
+        "最近的问题已变化，这次请求没有填入。请重新明确一份普通项目文件。",
+        "warning",
+      );
+      return;
+    }
+    if (choice !== choiceLabel) {
+      notify(ctx, "已关闭：没有生成请求草稿。");
+      return;
+    }
+    fillGuidanceDraft(ctx, expected, draft);
   };
 
   const showWelcome = (ctx: ExtensionContext): void => {
@@ -1882,6 +2213,7 @@ export function registerPiAdapter(
   };
 
   const prepareExample = async (ctx: ExtensionContext): Promise<void> => {
+    const guidanceOrder = beginGuidanceOperation();
     const inspected = await inspectExamplePlan(ctx.cwd);
     if (inspected === "conflict") {
       notify(
@@ -2018,14 +2350,24 @@ export function registerPiAdapter(
         `下一步目标：${EXAMPLE_GOAL}。`,
         "未覆盖已有内容；示例目录本身不提供自动恢复。",
       ];
-      rememberResult(result);
-      setActionCard(ctx, {
-        actionId: callId,
-        state: "matched",
-        lines: result,
-      });
-      setWelcomePanel(ctx, result);
-      notify(ctx, `安全示例已准备：可在对话中使用“${EXAMPLE_GOAL}”。`);
+      const identity = currentIdentity(ctx);
+      const published = identity
+        ? publishResult(
+            ctx,
+            result,
+            { ...identity, category: "other_result", actionId: callId },
+            guidanceOrder,
+          )
+        : false;
+      if (published) {
+        setActionCard(ctx, {
+          actionId: callId,
+          state: "matched",
+          lines: result,
+        });
+        setWelcomePanel(ctx, result);
+        notify(ctx, `安全示例已准备：可在对话中使用“${EXAMPLE_GOAL}”。`);
+      }
     } catch {
       let fileExists = false;
       let directoryExists = false;
@@ -2051,20 +2393,30 @@ export function registerPiAdapter(
               : "没有确认创建任何示例内容。",
         "已保留已创建内容，未自动删除；示例目录本身不提供自动恢复。",
       ];
-      rememberResult(result);
-      setActionCard(ctx, {
-        actionId: callId,
-        state: "unknown",
-        lines: result,
-      });
-      setWelcomePanel(ctx, result);
-      notify(ctx, result.join(" "), "warning");
+      const identity = currentIdentity(ctx);
+      const published = identity
+        ? publishResult(
+            ctx,
+            result,
+            { ...identity, category: "other_result", actionId: callId },
+            guidanceOrder,
+          )
+        : false;
+      if (published) {
+        setActionCard(ctx, {
+          actionId: callId,
+          state: "unknown",
+          lines: result,
+        });
+        setWelcomePanel(ctx, result);
+        notify(ctx, result.join(" "), "warning");
+      }
     }
   };
 
   pi.registerCommand("agentglass", {
     description:
-      "查看 AgentGlass 帮助、准备安全示例、恢复最近修改或清理本地恢复数据",
+      "查看 AgentGlass 帮助、处理刚才的问题、准备安全示例、恢复最近修改或清理本地恢复数据",
     handler: async (args, ctx) => {
       let commandSession: string | undefined;
       try {
@@ -2086,6 +2438,7 @@ export function registerPiAdapter(
         notify(ctx, APPROVAL_UNAVAILABLE_REASON, "warning");
         return;
       }
+      currentRecentGuidance(ctx);
       let menuHasRecovery = Boolean(latestRecovery);
       if (latestRecovery) {
         try {
@@ -2103,12 +2456,18 @@ export function registerPiAdapter(
       }
       let action = args.trim().toLowerCase();
       if (!action) {
+        const helpChoice = "› 查看欢迎与帮助";
+        const startChoice = "✦ 开始一个文件任务";
+        const problemChoice = "⚑ 处理刚才的问题";
+        const exampleChoice = "✦ 准备安全示例";
+        const cleanupChoice = "× 清理本地恢复数据";
         const menuOptions = [
-          "› 查看欢迎与帮助",
-          "✦ 开始一个文件任务",
-          "✦ 准备安全示例",
+          helpChoice,
+          startChoice,
+          problemChoice,
+          exampleChoice,
           ...(menuHasRecovery ? ["↶ 恢复最近一次修改"] : []),
-          "× 清理本地恢复数据",
+          cleanupChoice,
           "关闭",
         ];
         let choice: string | undefined;
@@ -2118,19 +2477,23 @@ export function registerPiAdapter(
           notify(ctx, MENU_UNAVAILABLE, "warning");
           return;
         }
-        const recoveryChoice = menuHasRecovery ? menuOptions[3] : undefined;
+        const recoveryChoice = menuHasRecovery
+          ? "↶ 恢复最近一次修改"
+          : undefined;
         action =
-          choice === menuOptions[0]
+          choice === helpChoice
             ? "help"
-            : choice === menuOptions[1]
+            : choice === startChoice
               ? "start"
-              : choice === menuOptions[2]
-                ? "example"
-                : recoveryChoice && choice === recoveryChoice
-                  ? "restore"
-                  : choice === menuOptions[menuOptions.length - 2]
-                    ? "cleanup"
-                    : "";
+              : choice === problemChoice
+                ? "process"
+                : choice === exampleChoice
+                  ? "example"
+                  : recoveryChoice && choice === recoveryChoice
+                    ? "restore"
+                    : choice === cleanupChoice
+                      ? "cleanup"
+                      : "";
       }
       if (
         action === "help" ||
@@ -2151,6 +2514,15 @@ export function registerPiAdapter(
         return;
       }
       if (
+        action === "process" ||
+        action === "处理" ||
+        action === "处理问题" ||
+        action === "处理刚才的问题"
+      ) {
+        await processRecentProblem(ctx);
+        return;
+      }
+      if (
         action === "example" ||
         action === "示例" ||
         action === "准备示例" ||
@@ -2160,25 +2532,55 @@ export function registerPiAdapter(
         return;
       }
       if (action === "restore" || action === "恢复") {
+        const guidanceOrder = beginGuidanceOperation();
         const entry = latestRecovery;
         const snapshots = entry ? await loadSnapshotModule() : undefined;
+        let recoveryIsCurrent = false;
         if (
-          !entry ||
-          entry.sessionId !== commandSession ||
-          entry.cwd !== ctx.cwd ||
-          !snapshots ||
-          !(await snapshots.recoveryEntryIsCurrent(snapshotRoot, entry))
+          entry &&
+          entry.sessionId === commandSession &&
+          entry.cwd === ctx.cwd &&
+          snapshots
         ) {
+          recoveryIsCurrent = await snapshots.recoveryEntryIsCurrent(
+            snapshotRoot,
+            entry,
+          );
+        }
+        if (!recoveryIsCurrent) {
+          const sameCurrentContext = Boolean(
+            entry &&
+              entry.sessionId === commandSession &&
+              entry.cwd === ctx.cwd &&
+              snapshots,
+          );
+          if (sameCurrentContext && entry) {
+            const seed = {
+              sessionId: entry.sessionId,
+              cwd: entry.cwd,
+              category: "recovery_conflict" as const,
+              actionId: entry.actionId,
+              effectId: entry.effectId,
+              targetId: entry.targetId,
+              ...(entry.relativeTarget
+                ? { relativeTarget: entry.relativeTarget }
+                : {}),
+            };
+            publishGuidance(ctx, seed, guidanceOrder);
+          }
           if (entry && latestRecovery === entry) latestRecovery = undefined;
           notify(
             ctx,
-            entry
-              ? "已停止：当前文件与这次修改完成后的记录不一致，已保留当前内容。"
-              : "当前会话没有可用的最近恢复项。",
+            !entry
+              ? "当前会话没有可用的最近恢复项。"
+              : !snapshots
+                ? SNAPSHOT_MODULE_UNAVAILABLE_REASON
+                : "已停止：当前文件与这次修改完成后的记录不一致，已保留当前内容。",
             "warning",
           );
           return;
         }
+        if (!entry || !snapshots) return;
         const callId = randomUUID();
         const payload = {
           snapshotId: entry.snapshotId,
@@ -2216,6 +2618,8 @@ export function registerPiAdapter(
         if (choice !== "continue") {
           invalidateApprovalToken(token);
           pendingTokens.delete(token);
+          const seed = genericGuidance(ctx, "user_cancellation");
+          if (seed) publishGuidance(ctx, seed, guidanceOrder);
           notify(ctx, "已停止：未批准恢复，文件和恢复入口均保留。");
           return;
         }
@@ -2257,21 +2661,44 @@ export function registerPiAdapter(
           `权限：${result.permissions === "matched" ? "已匹配记录" : result.permissions === "not_applicable" ? "不适用" : "未确认"}。`,
           "这次恢复入口已消费；不会自动重试或创建 redo。",
         ]);
-        rememberResult(resultLines);
-        setActionCard(ctx, {
-          actionId: callId,
-          state:
-            result.status === "restored"
-              ? "matched"
-              : result.status === "conflict"
-                ? "mismatch"
-                : "unknown",
-          lines: resultLines,
-        });
+        const recoveryCategory: RecentGuidanceCategory =
+          result.status === "restored"
+            ? "recovery_complete"
+            : result.status === "conflict"
+              ? "recovery_conflict"
+              : "recovery_failed";
+        const published = publishResult(
+          ctx,
+          resultLines,
+          {
+            sessionId: entry.sessionId,
+            cwd: entry.cwd,
+            category: recoveryCategory,
+            actionId: entry.actionId,
+            effectId: entry.effectId,
+            targetId: entry.targetId,
+            ...(entry.relativeTarget
+              ? { relativeTarget: entry.relativeTarget }
+              : {}),
+          },
+          guidanceOrder,
+        );
+        if (published)
+          setActionCard(ctx, {
+            actionId: callId,
+            state:
+              result.status === "restored"
+                ? "matched"
+                : result.status === "conflict"
+                  ? "mismatch"
+                  : "unknown",
+            lines: resultLines,
+          });
         return;
       }
 
       if (action === "cleanup" || action === "清理") {
+        const guidanceOrder = beginGuidanceOperation();
         const snapshots = await loadSnapshotModule();
         if (!snapshots) {
           notify(ctx, SNAPSHOT_MODULE_UNAVAILABLE_REASON, "warning");
@@ -2352,8 +2779,16 @@ export function registerPiAdapter(
             ? "待清理集合在批准期间发生变化，未继续删除。"
             : "只处理了已验证归属的 AgentGlass 私有数据。",
         ]);
-        rememberResult(cleanupResult);
-        setWelcomePanel(ctx, cleanupResult);
+        const identity = currentIdentity(ctx);
+        const published = identity
+          ? publishResult(
+              ctx,
+              cleanupResult,
+              { ...identity, category: "other_result", actionId: callId },
+              guidanceOrder,
+            )
+          : false;
+        if (published) setWelcomePanel(ctx, cleanupResult);
         notify(
           ctx,
           `清理结果：已删除 ${result.deleted} 个文件，${result.failed} 个失败并已保留。`,
@@ -2364,7 +2799,7 @@ export function registerPiAdapter(
       if (action)
         notify(
           ctx,
-          "可用操作：/agentglass help、/agentglass start、/agentglass example、/agentglass restore 或 /agentglass cleanup。",
+          "可用操作：/agentglass help、/agentglass process、/agentglass start、/agentglass example、/agentglass restore 或 /agentglass cleanup。",
         );
     },
   });
@@ -2373,6 +2808,7 @@ export function registerPiAdapter(
     clearRun();
     latestRecovery = undefined;
     latestResult = undefined;
+    clearRecentGuidance();
     try {
       const current = ctx.sessionManager.getSessionId();
       sessionId = nonEmptyString(current) ? current : undefined;
@@ -2406,6 +2842,7 @@ export function registerPiAdapter(
     let batch: readonly TransientHostExecutionInput[];
     let currentToken: ApprovalToken | undefined;
     const toolCallId = event.toolCallId;
+    const guidanceOrder = ++guidanceSequence;
     try {
       if (activeExecutions.has(toolCallId)) throw new Error();
       batch = mapToolCall(pi, event, ctx, sessionId, userGoal);
@@ -2423,8 +2860,16 @@ export function registerPiAdapter(
         hostExecutionId: current.hostExecutionId,
         toolName: current.tool.name,
         cwd: current.cwd,
+        guidanceOrder,
       });
     } catch (error) {
+      const seed = genericGuidance(
+        ctx,
+        error instanceof SiblingContextError
+          ? "batch_context_unknown"
+          : "other_blocked",
+      );
+      if (seed) publishGuidance(ctx, seed, guidanceOrder);
       return {
         block: true,
         reason:
@@ -2483,10 +2928,38 @@ export function registerPiAdapter(
         await observe(observed);
 
         if (prepared.risk.reasonCodes.includes("BATCH_MUTATION_BLOCKED")) {
+          publishGuidance(
+            ctx,
+            {
+              ...actionGuidance(
+                observed,
+                !prepared.hasStrictSiblingReason &&
+                  canOfferSequentialDraft(currentRisk)
+                  ? "batch_mutation"
+                  : "other_blocked",
+                undefined,
+              ),
+            },
+            guidanceOrder,
+          );
           activeExecutions.delete(toolCallId);
           return { block: true as const, reason: MULTIPLE_MUTATIONS_REASON };
         }
         if (prepared.risk.reasonCodes.includes("BATCH_CONTEXT_UNKNOWN")) {
+          publishGuidance(
+            ctx,
+            {
+              ...actionGuidance(
+                observed,
+                !prepared.hasStrictSiblingReason &&
+                  canOfferSequentialDraft(currentRisk)
+                  ? "batch_context_unknown"
+                  : "other_blocked",
+                undefined,
+              ),
+            },
+            guidanceOrder,
+          );
           activeExecutions.delete(toolCallId);
           return { block: true as const, reason: BATCH_CONTEXT_REASON };
         }
@@ -2503,6 +2976,11 @@ export function registerPiAdapter(
           return undefined;
         }
         if (currentRisk.decision === "hard_block") {
+          publishGuidance(
+            ctx,
+            actionGuidance(observed, "other_blocked", effect),
+            guidanceOrder,
+          );
           activeExecutions.delete(toolCallId);
           return {
             block: true as const,
@@ -2516,6 +2994,11 @@ export function registerPiAdapter(
           !ctx.hasUI ||
           observed.capabilities.canPromptForApproval !== "yes"
         ) {
+          publishGuidance(
+            ctx,
+            actionGuidance(observed, "other_blocked", effect),
+            guidanceOrder,
+          );
           activeExecutions.delete(toolCallId);
           return { block: true as const, reason: APPROVAL_UNAVAILABLE_REASON };
         }
@@ -2526,6 +3009,11 @@ export function registerPiAdapter(
           observed.action,
         );
         if (!verificationTarget) {
+          publishGuidance(
+            ctx,
+            actionGuidance(observed, "other_blocked", effect),
+            guidanceOrder,
+          );
           activeExecutions.delete(toolCallId);
           return { block: true as const, reason: SAFETY_BLOCK_REASON };
         }
@@ -2538,6 +3026,11 @@ export function registerPiAdapter(
             verificationTarget,
           );
         } catch {
+          publishGuidance(
+            ctx,
+            actionGuidance(observed, "other_blocked", effect),
+            guidanceOrder,
+          );
           activeExecutions.delete(toolCallId);
           return { block: true as const, reason: SAFETY_BLOCK_REASON };
         }
@@ -2565,6 +3058,11 @@ export function registerPiAdapter(
           invalidateApprovalToken(token);
           pendingTokens.delete(token);
           currentToken = undefined;
+          publishGuidance(
+            ctx,
+            actionGuidance(observed, "user_cancellation", undefined),
+            guidanceOrder,
+          );
           activeExecutions.delete(toolCallId);
           return { block: true as const, reason: APPROVAL_STOPPED_REASON };
         }
@@ -2627,12 +3125,18 @@ export function registerPiAdapter(
             targetPath: verificationTarget.targetPath,
             expected,
             preImage: observed.preImage,
+            guidanceOrder,
             inFlight: false,
           });
           setActionCard(ctx, renderOutcomeCardUpdate(observed.action, effect));
           return undefined;
         }
         activeExecutions.delete(toolCallId);
+        publishGuidance(
+          ctx,
+          actionGuidance(observed, "other_blocked", effect),
+          guidanceOrder,
+        );
         return { block: true as const, reason: APPROVAL_CHANGED_REASON };
       }
     } catch {
@@ -2642,10 +3146,13 @@ export function registerPiAdapter(
         pendingTokens.delete(currentToken);
       }
       activeExecutions.delete(toolCallId);
+      const seed = genericGuidance(ctx, "other_blocked");
+      if (seed) publishGuidance(ctx, seed, guidanceOrder);
       return { block: true as const, reason: BLOCK_REASON };
     }
   });
   pi.on("tool_result", async (event, ctx) => {
+    currentRecentGuidance(ctx);
     const read = pendingReads.get(event.toolCallId);
     if (read) {
       pendingReads.delete(event.toolCallId);
@@ -2668,6 +3175,18 @@ export function registerPiAdapter(
 
     const pending = pendingVerifications.get(event.toolCallId);
     if (!pending || pending.inFlight) return;
+    const identity = currentIdentity(ctx);
+    if (
+      !identity ||
+      identity.sessionId !== pending.binding.sessionId ||
+      identity.cwd !== pending.binding.cwd
+    ) {
+      // 目录或会话已切换时，迟到结果既不能成为当前问题，也不能继续覆盖当前卡。
+      clearRecentGuidance();
+      pendingVerifications.delete(event.toolCallId);
+      activeExecutions.delete(event.toolCallId);
+      return;
+    }
     pending.inFlight = true;
     const generation = runGeneration;
     const matches = resultBindingMatches(
@@ -2722,11 +3241,16 @@ export function registerPiAdapter(
             "superseded",
           ));
         if (replacementRecorded) {
+          const relativeTarget = safeRelativeGuidanceTarget(
+            pending.binding.cwd,
+            pending.targetPath,
+          );
           latestRecovery = Object.freeze({
             ...ready,
             sessionId: pending.binding.sessionId,
             cwd: pending.binding.cwd,
             targetLabel: pending.effect.targetLabel,
+            ...(relativeTarget ? { relativeTarget } : {}),
           });
           recoveryAvailable = true;
         }
@@ -2744,11 +3268,28 @@ export function registerPiAdapter(
       report,
       recoveryAvailable,
     );
-    rememberResult(resultUpdate.lines);
-    setActionCard(ctx, resultUpdate);
+    const guidanceCategory: RecentGuidanceCategory = !matches
+      ? "other_blocked"
+      : report.status === "matched"
+        ? "verification_matched"
+        : report.status === "mismatch"
+          ? "verification_mismatch"
+          : "verification_unknown";
+    const published = publishResult(
+      ctx,
+      resultUpdate.lines,
+      pendingGuidance(
+        pending,
+        guidanceCategory,
+        matches && report.status !== "matched",
+      ),
+      pending.guidanceOrder,
+    );
+    if (published) setActionCard(ctx, resultUpdate);
     pendingVerifications.delete(event.toolCallId);
   });
   pi.on("tool_execution_end", (event, ctx) => {
+    currentRecentGuidance(ctx);
     let endMatches = false;
     try {
       const currentSession = ctx.sessionManager.getSessionId();
@@ -2777,8 +3318,13 @@ export function registerPiAdapter(
           "RESULT_MISSING",
         ),
       );
-      rememberResult(resultUpdate.lines);
-      setActionCard(ctx, resultUpdate);
+      const published = publishResult(
+        ctx,
+        resultUpdate.lines,
+        pendingGuidance(pending, "verification_unknown", true),
+        pending.guidanceOrder,
+      );
+      if (published) setActionCard(ctx, resultUpdate);
       pendingVerifications.delete(event.toolCallId);
     }
     if (pendingReads.delete(event.toolCallId))
@@ -2790,5 +3336,6 @@ export function registerPiAdapter(
     clearRun();
     latestRecovery = undefined;
     sessionId = undefined;
+    clearRecentGuidance();
   });
 }

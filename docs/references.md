@@ -2160,7 +2160,7 @@ N-001 测试实际覆盖三类成功草稿、锁定 `Editor` 与 `InteractiveMod
 
 | development-plan §9.3 条目 | 实际状态 | 证据/限制 |
 |---|---|---|
-| 1. 菜单、三类引导、字段收集、取消/空值、边界、不扫描/不建目录 | PASS（本地任务证据） | 见 §45.1、integration 32/32；待用户评审 |
+| 1. 菜单、三类引导、字段收集、取消/空值、边界、不扫描/不建目录 | PASS（本地任务证据） | 见 §45.1、integration 33/33；用户评审完成 |
 | 2. 三个固定中文普通请求，无 shell/自动发送/批准，实际调用仍走原链路 | PASS（本地任务证据） | 草稿只填输入框；未执行文件工具；0.8.0 对外能力声明未改 |
 | 3. 共用填入、TUI/session/cwd/idle/空编辑器、代次与最终同步读写、竞态保护 | PASS（本地任务证据） | 真实锁定 InteractiveMode 的 ExtensionUIContext 映射测试 + runner 状态测试；受控 UI，不宣称抵抗恶意共存扩展 |
 | 4. 缺能力/取消/异常/读失败/超限/投影改变不写入，写失败不重试/清空/发送 | PASS（本地任务证据） | 无 UI、UI/get/set 异常、路径/输入失败和超限均有断言 |
@@ -2177,3 +2177,120 @@ N-001 测试实际覆盖三类成功草稿、锁定 `Editor` 与 `InteractiveMod
 - 补齐 cwd 异步变化、最终 `getEditorText` 异常、脱敏异常、最终 get/set 顺序和共享菜单异常文案回归；失败路径均断言不写入、不发送、不调用工具、不改项目文件。
 - 重新执行最终门禁：`npm run typecheck`、`npm run lint`、`npm run build`、`npm run test:unit`（8 files / 65 tests）、`npm run test:security`（9 files / 65 tests）、`npm run test:integration`（2 files / 33 tests），全部退出码 0。`git diff --check` 退出码 0（仅 CRLF 转换提示）。
 - 因真实锁定 InteractiveMode 证据已补齐，N-001 §9.3 条目 3/5 与 security-invariants §16 的适用映射维持 `PASS（本地任务证据）`；该 PASS 不包含真实人工 TUI、人工发送或 Human Validation，三者仍为 `NOT_RUN`。
+
+## 46. N-002 前置审查阻塞（历史记录，2026-09-15）
+
+本次明确分配为 N-002，但 development-plan §9.1/§9.4 要求 N-001 必需门通过且完成用户评审后才能开始。当时 §45.3/§45.4 只记录 N-001 本地工程门和锁定 Pi InteractiveMode 合约通过，并明确写着“待用户评审”；因此当时未实现 N-002，未绕过依赖，也未开始 N-003/N-004 或重启 Pi Web。该阻塞已由 §47 的用户评审记录解除；N-002 仍未开始。
+
+实际前置核对：当前 HEAD 为 `28ef63ab3311249c26f44b34542014acfd6a2a3f`（`添加常用任务起步器`），与 §44/§45 记录的 N-001 前置 HEAD `d8aff3d1a952c0b23659985d1728091fd19aba32` 不同；工作树干净（`git status --short --branch` 为 `## main...origin/main`，`git diff --name-only` 为空，`git diff --check` 退出码 0）。`package.json`/lockfile 仍为 `0.8.0`、lockfile v3，锁定 Pi coding-agent/pi-tui 均为 `0.85.1`；`npm ls @earendil-works/pi-coding-agent @earendil-works/pi-tui --depth=0` 退出码 0。没有修改 package、lockfile、`.gitignore`、版本、发布或外部状态。
+
+以下命令是在当前 HEAD 上对已有 N-001 工作树进行的基线重跑，不是 N-002 通过证据：
+
+| 命令 | 退出码 | 实际结果 |
+|---|---:|---|
+| `npm run typecheck` | 0 | `tsc --noEmit` 通过 |
+| `npm run lint` | 0 | Biome 检查 45 files，无 error |
+| `npm run build` | 0 | `tsc -p tsconfig.build.json` 通过 |
+| `npm run test:unit` | 0 | 8 files / 65 tests PASS |
+| `npm run test:security` | 0 | 9 files / 65 tests PASS |
+| `npm run test:integration` | 0 | 2 files / 33 tests PASS |
+| `npm run test:e2e` | 0 | 1 file / 14 tests PASS |
+
+N-002 §9.4 条目 1～6 均为 `NOT_RUN（前置阻塞）`；没有新增最近上下文、菜单、草稿、自动重试、授权复用或结果存储。N-002 适用 `INV-002/003/005/007～010/012/013/016/019/020` 仍为 `NOT_RUN`，没有把现有测试名称、历史 PASS 或当前基线重跑写成新增映射证据。因未改变风险/分类，`npm run test:corpus` 按任务规则为 `NOT_RUN`。Human Validation、真实人工 TUI/发送仍为 `NOT_RUN`。本轮文件变更仅为本条阻塞证据与状态标注；源码未变更。完成 N-001 用户评审后，下一可重新分配任务为 N-002。
+
+## 47. N-001 用户评审完成（2026-09-15）
+
+本次用户明确要求完成 N-001 用户评审。评审依据为当前 HEAD `28ef63ab3311249c26f44b34542014acfd6a2a3f`、§45 的实现与锁定 Pi InteractiveMode 合约证据、§45.4 的审查补测，以及 §46 在当前 HEAD 上记录的工程门重跑结果。审查确认 N-001 §9.3 条目 1～6 均已具备本地工程证据，适用 `INV-003/005/008/012/015/016/019/020` 映射保持 PASS；没有 N-002～N-004 代码、菜单、上下文或持久化变更。
+
+当前状态：N-001 用户评审完成；N-002 为下一可重新分配任务但仍 `NOT_STARTED`，本轮不自动开始。真实人工 TUI、人工发送、参与者研究和 Human Validation 仍为 `NOT_RUN`，不由本次用户评审替代。当前工作树仅保留文档修改，`git diff --check` 退出码 0；未修改 package/lockfile、`.gitignore`、README、全局配置或外部发布状态。
+
+## 48. N-002 卡住后的处理入口实际任务证据（2026-09-15）
+
+本节记录在 N-001 用户评审证据（§47）已存在后重新分配的 N-002。未执行 N-003/N-004，未重启 Pi Web，不改变已发布 `@hugo-ddt/agentglass@0.8.0` 的公开能力。执行环境为 Windows，Node `v24.14.0`、npm `11.9.0`；当前 HEAD `28ef63ab3311249c26f44b34542014acfd6a2a3f`；Pi `@earendil-works/pi-coding-agent@0.85.1`、`@earendil-works/pi-tui@0.85.1`。`package.json`、`package-lock.json`、peer 范围、`.gitignore`、版本和运行时依赖未修改；lockfile diff 为空。
+
+### 48.1 实现范围与安全边界
+
+- 在既有 `src/adapter/pi/adapter.ts` 的结果发布路径增加一个当前 session/cwd 的结构化最近处理上下文：只保存 session/cwd、可靠的 action/effect/target 关联、递增更新代次、固定类别及安全精确的项目相对目标；不解析 `latestResult` 中文文案，不保存 raw input、批次、用户目标、结果正文、快照正文、编辑器正文或 token。
+- read 状态不覆盖上下文；同一动作的后续状态更新同一项，新动作替换旧项；迟到旧结果按发布次序拒绝覆盖新项。`agent_end` 保留已发布项；新 session、cwd/reload/shutdown 清理；菜单和最终填入前后重验 session/cwd/引导代次/空闲/UI 状态。
+- `/agentglass` 新增“处理刚才的问题”。完整多变更或 sibling 不完整时，仅提供用户主动选择的“每次只改一个文件”草稿，并且只使用固定中文说明；若同时含敏感、越界、未知、完整性等更严格原因，不用顺序请求掩盖。核验 mismatch/unknown、恢复冲突仅在安全精确目标可表示时提供“先查看这份文件”；无安全目标、失败、不支持或已确认结果只显示固定说明和明确的普通文件下一步，不给一键重试。
+- 复用 N-001 的同一编辑器填入路径；仅写入空输入框，保留非空内容，不自动发送、排队、重试、提交或复用旧批准。主动 Stop/取消只说明当前步骤未获批准；可能已执行的失败不写成未执行。新增逻辑含中文意图、生命周期、边界和安全约束注释。
+
+### 48.2 测试覆盖与 Pi/草稿结果分离
+
+新增 `tests/integration/pi-adapter.test.ts` 三项 N-002 场景和 `tests/e2e/pi-dispatch.test.ts` 一项真实 Pi package entry 场景。覆盖：多变更、sibling 不完整、多个并存风险不得被顺序提示掩盖、核验 mismatch/unknown、恢复冲突、已确认结果、其他阻止、迟到旧结果、read 提示不覆盖、同名不同路径、无安全目标、输入框保护、agent 运行中、菜单期间上下文变化、取消、agent_end 保留、session/cwd/reload/shutdown 清理。测试不把展示 label 当目标 identity，也不把最近上下文当授权。
+
+“Pi 是否遵守请求”与“草稿填入”分开记录：真实 Pi agent loop 的多文件 write 提案由 sibling gate 阻止两次，未创建文件、未执行变更，证明 Pi 调度遵守 AgentGlass 的单变更安全门；它不证明模型会遵守尚未发送的草稿。真实 Pi package entry 的 N-002 测试另行确认草稿成功填入输入框，发送调用次数不变，且未执行工具。两者均为受控自动化证据，不是真人 TUI。
+
+### 48.3 工程门与实际命令
+
+以下命令均使用锁定 Node 24 npm CLI 执行：`G:\nodejs\node.exe G:\nodejs\node_modules\npm\bin\npm-cli.js run <script>`。最终结果如下：
+
+| 命令 | 退出码 | 实际结果 |
+|---|---:|---|
+| `npm run typecheck` | 0 | `tsc --noEmit` 通过 |
+| `npm run lint` | 0 | Biome 检查 45 files，无 error |
+| `npm run build` | 0 | `tsc -p tsconfig.build.json` 通过 |
+| `npm run test:unit` | 0 | 8 files / 65 tests PASS |
+| `npm run test:security` | 0 | 9 files / 65 tests PASS |
+| `npm run test:integration` | 0 | 2 files / 36 tests PASS |
+| `npm run test:e2e` | 0 | 1 file / 15 tests PASS |
+
+`git diff --check` 最终退出码 `0`；Biome 格式化后再次执行 typecheck/lint/build 均退出码 `0`。本任务没有改变 risk/classification 规则，只消费既有 reason code 决定是否可提供顺序草稿，故按 §9.2 `npm run test:corpus` 为 `NOT_RUN`，没有借空 corpus 宣称覆盖。N-002 的自动化安全门与工程门为 `PASS（本地证据）`；真实人工 TUI、用户实际发送、参与者研究、Human Validation、远端 CI 和发布均为 `NOT_RUN`。
+
+### 48.4 N-002 Done Definition 对照
+
+| development-plan §9.4 条目 | 实际状态 | 证据/限制 |
+|---|---|---|
+| 1. 结构化当前最近项、已有事实关联、read 不覆盖、迟到旧结果不覆盖、无历史/raw | PASS（本地任务证据） | adapter 发布路径与 integration 的 read/同名/迟到/lifecycle 场景；单项内存上下文，不含正文或 token |
+| 2. 处理入口、顺序提案、可安全目标的查看草稿、严格原因不降级、失败固定说明 | PASS（本地任务证据） | integration 覆盖完整/不完整/严格 sibling、mismatch/unknown、恢复冲突、无目标与已确认/其他阻止；没有重试或关闭保护文案 |
+| 3. 不安全目标/无上下文/替换/跨 session-cwd 不猜目标；Stop/取消不催促；失败不写未执行 | PASS（本地任务证据） | integration 覆盖取消、agent_end、session/cwd/reload、菜单期间变化、无安全目标及未知结果 |
+| 4. 复用 N-001 填入，保护输入，不自动发送/排队/重试/复用授权；运行中不启动；异步返回重验 | PASS（本地任务证据） | 共享填入函数与 editor protection/lifecycle assertions；真实 Pi E2E 仅填入且发送次数不变 |
+| 5. 必需工程/security/integration/e2e 通过，覆盖类别和边界；顺序请求不假称 Pi 必遵守 | PASS（本地任务证据） | 七项命令均退出 0；Pi 安全阻止与草稿填入分开报告，未声称模型遵守未发送草稿 |
+| 6. INV-002/003/005/007～010/012/013/016/019/020 映射、无 D 菜单/多结果存储、下一任务 N-003 | PASS（本地任务证据） | security-invariants §16 N-002 映射更新为 PASS；无 D 菜单或结果历史；N-003 仅列为下一可分配任务，未自动开始 |
+
+### 48.5 状态与限制
+
+当前 N-002 状态为“本地工程与受控 Pi 自动化完成，待用户评审”；N-001 的前置评审来自 §47，未绕过依赖。用户未提供真实人工 TUI/发送记录，因此 Human Validation 保持 `NOT_RUN`。本轮仅修改 `src/adapter/pi/adapter.ts`、`tests/integration/pi-adapter.test.ts`、`tests/e2e/pi-dispatch.test.ts` 及本节关联状态文档；未修改 `.gitignore`、package/lockfile、README、版本、外部发布状态，也未 commit/push/tag/PR。下一可分配任务为 N-003，但须在 N-002 用户评审后由用户明确分配。
+
+## 49. N-002 用户评审完成（2026-09-15）
+
+用户明确要求完成 N-002 用户评审。评审依据为当前 HEAD `28ef63ab3311249c26f44b34542014acfd6a2a3f`、§48 的实际实现说明、覆盖矩阵、锁定 Pi 自动化证据和最终七项工程门结果。评审确认 development-plan §9.4 条目 1～6 均已具备本地证据：结构化最近上下文、处理入口与安全精确目标、失败/取消/生命周期边界、N-001 填入保护与不自动发送、必需自动化门及 INV 映射均满足；没有增加 N-003 菜单、结果历史或恢复系统。
+
+N-002 用户评审状态更新为 `COMPLETED`。security-invariants §16 的 N-002 映射保持 `PASS`，适用 `INV-002/003/005/007～010/012/013/016/019/020`；该 PASS 仅表示本地工程与受控锁定 Pi 自动化证据，不扩大为真人理解或宿主全局防护证明。Human Validation、真实人工 TUI、用户实际发送、参与者研究、远端 CI 和发布仍为 `NOT_RUN`。
+
+本次评审未执行 N-003/N-004，未重启 Pi Web，未修改源码、测试、package、lockfile、版本或外部状态；保留当前工作树中的 N-002 实现与测试修改。下一可分配任务为 N-003，但不自动开始，须由用户另行明确分配。
+
+## 50. N-002 代次绑定修复与回归复测（2026-09-15）
+
+本节记录用户在 N-002 用户评审后要求修复的代次绑定问题。修复仍只属于 N-002，不启动 N-003/N-004，不重启 Pi Web，不改变已发布 `@hugo-ddt/agentglass@0.8.0` 的公开能力。
+
+### 50.1 修复范围
+
+- 在 `src/adapter/pi/adapter.ts` 增加共用的内部操作启动代次入口。安全示例、恢复和清理命令均在第一个 `await` 前取得代次，完成时沿用该代次发布最近上下文。
+- 内部结果只有在 session/cwd 和代次校验接受后才更新 `latestResult`、操作卡或欢迎面板；迟到结果不会把自身重新编号成新结果，也不会无条件覆盖当前 UI。
+- 工具调用原有的启动代次、结果关联和生命周期保护保持不变；没有新增存储、重试、授权复用或恢复系统。
+
+### 50.2 回归证据
+
+新增 `tests/integration/pi-adapter.test.ts` 的 `N-002 rejects late internal example, restore, and cleanup results` 场景。测试在示例、恢复、清理审批等待期间分别发布一个更新的安全阻止结果，然后确认：实际已批准操作的文件事实仍如实保留；旧内部结果不覆盖操作卡/欢迎面板；`/agentglass process` 仍处理更新后的安全阻止结果；没有自动重试或自动发送。
+
+环境仍为 Windows、Node `v24.14.0`、npm `11.9.0`、锁定 Pi `0.85.1`；HEAD 仍为 `28ef63ab3311249c26f44b34542014acfd6a2a3f`。package/lockfile、`.gitignore`、版本、运行时依赖和外部发布状态未修改。
+
+| 命令 | 退出码 | 实际结果 |
+|---|---:|---|
+| `npm run typecheck` | 0 | `tsc --noEmit` 通过 |
+| `npm run lint` | 0 | Biome 检查 45 files，无 error |
+| `npm run build` | 0 | `tsc -p tsconfig.build.json` 通过 |
+| `npm run test:unit` | 0 | 8 files / 65 tests PASS |
+| `npm run test:security` | 0 | 9 files / 65 tests PASS |
+| `npm run test:integration` | 0 | 2 files / 37 tests PASS |
+| `npm run test:e2e` | 0 | 1 file / 15 tests PASS |
+| `git diff --check` | 0 | 通过；仅有文档 CRLF 转换提示 |
+
+本次只修复结果代次与 UI 发布边界，未改变 risk/classification 规则，故 `npm run test:corpus` 为 `NOT_RUN`。Human Validation、真实人工 TUI、用户实际发送、参与者研究、远端 CI 和发布仍为 `NOT_RUN`。Pi 遵守请求与草稿填入仍分开报告：本次新增回归只验证 Pi/adapter 的安全阻止和本地 UI 状态，不证明模型会遵守未发送草稿。
+
+### 50.3 Done Definition 与状态
+
+N-002 §9.4 的代次相关要求经补丁和回归测试重新核验：内部操作在开始时绑定代次，迟到示例/恢复/清理结果不能覆盖新结果；现有 session/cwd、read 不覆盖、无自动重试/发送、输入框保护和安全门保持通过。N-002 状态维持 `COMPLETED（本地工程门、用户评审及修复复测完成）`；适用 `INV-002/003/005/007～010/012/013/016/019/020` 映射维持 `PASS（本地工程与受控锁定 Pi 自动化证据）`，其中真人理解、宿主全局防护和 Human Validation 不在该 PASS 内。
+
+下一可分配任务仍为 N-003，但本次不自动开始。未执行 commit、push、tag、PR、发布或 Pi Web 操作。

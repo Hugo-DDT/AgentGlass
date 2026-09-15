@@ -1,4 +1,11 @@
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -400,6 +407,36 @@ async function emitBatch(
       }),
     ),
   );
+}
+
+async function emitResult(
+  runtime: Awaited<ReturnType<typeof createRuntime>>,
+  call: { id: string; name: string; arguments: Record<string, unknown> },
+  options?: { input?: unknown; error?: boolean },
+): Promise<void> {
+  await runtime.session.extensionRunner.emitToolResult({
+    type: "tool_result",
+    toolCallId: call.id,
+    toolName: call.name,
+    input: (options?.input ?? call.arguments) as Record<string, unknown>,
+    content: [{ type: "text", text: "ignored" }],
+    details: undefined,
+    isError: options?.error ?? false,
+  });
+}
+
+async function emitEnd(
+  runtime: Awaited<ReturnType<typeof createRuntime>>,
+  call: { id: string; name: string },
+  error = false,
+): Promise<void> {
+  await runtime.session.extensionRunner.emit({
+    type: "tool_execution_end",
+    toolCallId: call.id,
+    toolName: call.name,
+    result: {},
+    isError: error,
+  });
 }
 
 test("Pi 0.85.1 maps the current goal, current siblings, and real execution identities", async () => {
@@ -2379,4 +2416,487 @@ test("N-001 reports UI read/write failures without retrying or clearing the edit
   expect(writeFailure.observed).toHaveLength(0);
   expect(await readdir(writeFailure.cwd)).toEqual(writeFiles);
   writeSend.mockRestore();
+});
+
+test("N-002 offers only a sequential draft for complete multi-change or incomplete siblings", async () => {
+  const multiple = await createRuntime();
+  const multipleSend = vi.spyOn(multiple.session, "sendUserMessage");
+  const multipleUi = installStarterUi(multiple, [
+    { value: "填入：每次只改一个文件" },
+  ]);
+  const multipleResults = await emitBatch(multiple, [
+    {
+      id: "multi-one",
+      name: "write",
+      arguments: { path: "one.txt", content: "one" },
+    },
+    {
+      id: "multi-two",
+      name: "write",
+      arguments: { path: "two.txt", content: "two" },
+    },
+  ]);
+  expect(multipleResults.every((result) => result?.block)).toBe(true);
+  await multiple.session.prompt("/agentglass process");
+  expect(multipleUi.editorText).toContain("每次只改一个文件");
+  expect(multipleUi.editorText).not.toContain("one.txt");
+  expect(multipleUi.editorText).not.toContain("two.txt");
+  expect(multipleUi.setCalls).toBe(1);
+  expect(multipleSend).not.toHaveBeenCalled();
+
+  const strict = await createRuntime();
+  const strictUi = installStarterUi(strict, [
+    { value: "填入：每次只改一个文件" },
+  ]);
+  const strictResults = await emitBatch(strict, [
+    {
+      id: "strict-env",
+      name: "write",
+      arguments: { path: ".env", content: "secret" },
+    },
+    {
+      id: "strict-note",
+      name: "write",
+      arguments: { path: "note.txt", content: "note" },
+    },
+  ]);
+  expect(strictResults.every((result) => result?.block)).toBe(true);
+  await strict.session.prompt("/agentglass process");
+  expect(strictUi.setCalls).toBe(0);
+  expect(strictUi.dialogCalls).toBe(0);
+  expect(strictUi.editorText).toBe("");
+  expect(strictUi.notifications.at(-1)?.message).toContain("安全检查停止");
+
+  const incomplete = await createRuntime();
+  const incompleteUi = installStarterUi(incomplete, [
+    { value: "填入：每次只改一个文件" },
+  ]);
+  const incompleteCall = {
+    id: "incomplete-sibling",
+    name: "write",
+    arguments: { path: "incomplete.txt", content: "must not run" },
+  };
+  incomplete.sessionManager.appendMessage({
+    ...assistantMessage([incompleteCall]),
+    content: [
+      {
+        type: "toolCall",
+        id: incompleteCall.id,
+        name: incompleteCall.name,
+        arguments: null,
+      },
+    ],
+  } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+  expect(
+    await incomplete.session.extensionRunner.emitToolCall({
+      type: "tool_call",
+      toolCallId: incompleteCall.id,
+      toolName: incompleteCall.name,
+      input: incompleteCall.arguments,
+    }),
+  ).toMatchObject({ block: true });
+  await incomplete.session.prompt("/agentglass process");
+  expect(incompleteUi.editorText).toContain("每次只改一个文件");
+  expect(incompleteUi.editorText).not.toContain("incomplete.txt");
+});
+
+test("N-002 keeps one exact verification target, ignores reads and late results, and preserves safety on lifecycle changes", async () => {
+  const runtime = await createRuntime();
+  installApprovalUi(runtime, [
+    { inputs: ["down", "down", "enter"] },
+    { inputs: ["down", "down", "enter"] },
+  ]);
+  await mkdir(join(runtime.cwd, "a"), { recursive: true });
+  await mkdir(join(runtime.cwd, "b"), { recursive: true });
+  await writeFile(join(runtime.cwd, "b/same.txt"), "readable", "utf8");
+  const first = {
+    id: "guidance-first",
+    name: "write",
+    arguments: { path: "a/same.txt", content: "expected" },
+  };
+  expect(await emitCall(runtime, first)).toBeUndefined();
+  await writeFile(join(runtime.cwd, "a/same.txt"), "different", "utf8");
+  await emitResult(runtime, first);
+  await emitEnd(runtime, first);
+
+  const read = {
+    id: "guidance-read",
+    name: "read",
+    arguments: { path: "b/same.txt" },
+  };
+  expect(await emitCall(runtime, read)).toBeUndefined();
+  await emitResult(runtime, read);
+  await emitEnd(runtime, read);
+
+  const firstSend = vi.spyOn(runtime.session, "sendUserMessage");
+  const firstUi = installStarterUi(runtime, [
+    { value: "填入：先查看这份文件" },
+  ]);
+  await runtime.session.prompt("/agentglass process");
+  expect(firstUi.editorText).toContain("文件：a/same.txt");
+  expect(firstUi.editorText).not.toContain("b/same.txt");
+  expect(firstSend).not.toHaveBeenCalled();
+
+  const protectedEditor = await createRuntime();
+  const protectedCall = {
+    id: "protected-editor-context",
+    name: "write",
+    arguments: { path: "protected.txt", content: "blocked" },
+  };
+  expect(await emitCall(protectedEditor, protectedCall)).toMatchObject({
+    block: true,
+  });
+  const protectedUi = installStarterUi(
+    protectedEditor,
+    [{ value: "填入：先查看这份文件" }],
+    { editorText: "用户已有内容" },
+  );
+  await protectedEditor.session.prompt("/agentglass process");
+  expect(protectedUi.setCalls).toBe(0);
+  expect(protectedUi.editorText).toBe("用户已有内容");
+
+  const busy = await createRuntime();
+  await writeFile(join(busy.cwd, "busy.txt"), "busy", "utf8");
+  expect(
+    await emitCall(busy, {
+      id: "busy-context",
+      name: "write",
+      arguments: { path: "busy-context.txt", content: "blocked" },
+    }),
+  ).toMatchObject({ block: true });
+  expect(
+    await emitCall(busy, {
+      id: "busy-read",
+      name: "read",
+      arguments: { path: "busy.txt" },
+    }),
+  ).toBeUndefined();
+  const busyUi = installStarterUi(busy, [{ value: "填入：先查看这份文件" }]);
+  await busy.session.prompt("/agentglass process");
+  expect(busyUi.setCalls).toBe(0);
+  expect(busyUi.notifications.at(-1)?.message).toContain("正在处理任务");
+
+  const late = await createRuntime();
+  const lateApprovalUi = installApprovalUi(late, [
+    { inputs: ["down", "down", "enter"] },
+    { inputs: ["down", "down", "enter"] },
+  ]);
+  const oldCall = {
+    id: "late-old",
+    name: "write",
+    arguments: { path: "old.txt", content: "old" },
+  };
+  const newCall = {
+    id: "late-new",
+    name: "write",
+    arguments: { path: "new.txt", content: "new" },
+  };
+  expect(await emitCall(late, oldCall)).toBeUndefined();
+  expect(await emitCall(late, newCall)).toBeUndefined();
+  await writeFile(join(late.cwd, "new.txt"), "different", "utf8");
+  await emitResult(late, newCall);
+  await emitEnd(late, newCall);
+  await writeFile(join(late.cwd, "old.txt"), "different", "utf8");
+  await emitResult(late, oldCall);
+  await emitEnd(late, oldCall);
+  const latestCard = lateApprovalUi.widgets.at(-1)?.content?.join("\n") ?? "";
+  expect(latestCard).toContain("new.txt");
+  expect(latestCard).not.toContain("old.txt");
+  const lateUi = installStarterUi(late, [{ value: "填入：先查看这份文件" }]);
+  await late.session.prompt("/agentglass process");
+  expect(lateUi.editorText).toContain("文件：new.txt");
+  expect(lateUi.editorText).not.toContain("old.txt");
+  expect(lateApprovalUi.customCalls).toBe(2);
+
+  const cancelled = await createRuntime();
+  const cancelledApprovalUi = installApprovalUi(cancelled, [
+    { inputs: ["enter"] },
+  ]);
+  const cancelledCall = {
+    id: "cancelled-guidance",
+    name: "write",
+    arguments: { path: "cancelled.txt", content: "not approved" },
+  };
+  expect(await emitCall(cancelled, cancelledCall)).toMatchObject({
+    block: true,
+  });
+  const cancelledUi = installStarterUi(cancelled, [{ value: "关闭" }]);
+  await cancelled.session.prompt("/agentglass process");
+  expect(cancelledUi.setCalls).toBe(0);
+  expect(cancelledUi.editorText).toBe("");
+  expect(cancelledUi.notifications.at(-1)?.message).toContain(
+    "没有获得执行许可",
+  );
+  expect(cancelledUi.notifications.at(-1)?.message).not.toContain("重试");
+  expect(cancelledApprovalUi.customCalls).toBe(1);
+
+  const preserved = await createRuntime();
+  const preservedApprovalUi = installApprovalUi(preserved, [
+    { inputs: ["down", "down", "enter"] },
+  ]);
+  const preservedCall = {
+    id: "agent-end-guidance",
+    name: "write",
+    arguments: { path: "preserved.txt", content: "expected" },
+  };
+  expect(await emitCall(preserved, preservedCall)).toBeUndefined();
+  await writeFile(join(preserved.cwd, "preserved.txt"), "later", "utf8");
+  await emitResult(preserved, preservedCall);
+  await emitEnd(preserved, preservedCall);
+  await preserved.session.extensionRunner.emit({
+    type: "agent_end",
+    messages: [],
+  });
+  const preservedUi = installStarterUi(preserved, [
+    { value: "填入：先查看这份文件" },
+  ]);
+  await preserved.session.prompt("/agentglass process");
+  expect(preservedUi.editorText).toContain("文件：preserved.txt");
+  expect(preservedApprovalUi.customCalls).toBe(1);
+
+  const cleared = await createRuntime();
+  const clearedUi = installStarterUi(cleared, []);
+  const clearedCall = {
+    id: "session-clears-guidance",
+    name: "write",
+    arguments: { path: "cleared.txt", content: "blocked" },
+  };
+  expect(await emitCall(cleared, clearedCall)).toMatchObject({ block: true });
+  cleared.sessionManager.newSession({ id: "new-guidance-session" });
+  await cleared.session.extensionRunner.emit({
+    type: "session_start",
+    reason: "new",
+  });
+  await cleared.session.prompt("/agentglass process");
+  expect(clearedUi.setCalls).toBe(0);
+  expect(clearedUi.notifications.at(-1)?.message).toContain(
+    "没有可处理的最近问题",
+  );
+
+  const menuChanged = await createRuntime();
+  const menuChangedCall = {
+    id: "menu-old-context",
+    name: "write",
+    arguments: { path: "menu-old.txt", content: "blocked" },
+  };
+  expect(
+    (
+      await emitBatch(menuChanged, [
+        menuChangedCall,
+        {
+          id: "menu-old-sibling",
+          name: "write",
+          arguments: { path: "menu-old-sibling.txt", content: "blocked" },
+        },
+      ])
+    ).every((result) => result?.block),
+  ).toBe(true);
+  const menuChangedUi = installStarterUi(menuChanged, [
+    {
+      value: "填入：先查看这份文件",
+      onOpen: async () => {
+        await emitCall(menuChanged, {
+          id: "menu-new-context",
+          name: "read",
+          arguments: { path: "." },
+        });
+      },
+    },
+  ]);
+  await menuChanged.session.prompt("/agentglass process");
+  expect(menuChangedUi.setCalls).toBe(0);
+  expect(menuChangedUi.editorText).toBe("");
+  expect(menuChangedUi.notifications.at(-1)?.message).toContain(
+    "最近的问题已变化",
+  );
+
+  const cwdChanged = await createRuntime();
+  const cwdChangedCall = {
+    id: "cwd-old-context",
+    name: "write",
+    arguments: { path: "cwd-old.txt", content: "blocked" },
+  };
+  expect(
+    (
+      await emitBatch(cwdChanged, [
+        cwdChangedCall,
+        {
+          id: "cwd-old-sibling",
+          name: "write",
+          arguments: { path: "cwd-old-sibling.txt", content: "blocked" },
+        },
+      ])
+    ).every((result) => result?.block),
+  ).toBe(true);
+  const cwdChangedUi = installStarterUi(cwdChanged, [
+    {
+      value: "填入：每次只改一个文件",
+      onOpen: ({ setCwd }) => setCwd(join(cwdChanged.cwd, "changed-cwd")),
+    },
+  ]);
+  await cwdChanged.session.prompt("/agentglass process");
+  expect(cwdChangedUi.setCalls).toBe(0);
+  expect(cwdChangedUi.editorText).toBe("");
+  expect(cwdChangedUi.notifications.at(-1)?.message).toContain(
+    "最近的问题已变化",
+  );
+});
+
+test("N-002 offers viewing only for a safe recovery-conflict target and no target otherwise", async () => {
+  const recovery = await createRuntime();
+  const approvalUi = installApprovalUi(recovery, [
+    { inputs: ["down", "down", "enter"] },
+  ]);
+  const call = {
+    id: "recovery-conflict-guidance",
+    name: "write",
+    arguments: { path: "recover.txt", content: "after" },
+  };
+  await writeFile(join(recovery.cwd, "recover.txt"), "before", "utf8");
+  expect(await emitCall(recovery, call)).toBeUndefined();
+  await writeFile(join(recovery.cwd, "recover.txt"), "after", "utf8");
+  await emitResult(recovery, call);
+  await emitEnd(recovery, call);
+  await writeFile(join(recovery.cwd, "recover.txt"), "later", "utf8");
+  await recovery.session.prompt("/agentglass restore");
+  const recoveryUi = installStarterUi(recovery, [
+    { value: "填入：先查看这份文件" },
+  ]);
+  await recovery.session.prompt("/agentglass process");
+  expect(recoveryUi.editorText).toContain("文件：recover.txt");
+  expect(recoveryUi.editorText).not.toContain("恢复");
+  expect(approvalUi.customCalls).toBe(1);
+
+  const noTarget = await createRuntime();
+  const noTargetUi = installStarterUi(noTarget, []);
+  const noTargetCall = {
+    id: "no-safe-target",
+    name: "write",
+    arguments: { path: ".env", content: "secret" },
+  };
+  expect(await emitCall(noTarget, noTargetCall)).toMatchObject({ block: true });
+  await noTarget.session.prompt("/agentglass process");
+  expect(noTargetUi.setCalls).toBe(0);
+  expect(noTargetUi.dialogCalls).toBe(0);
+  expect(noTargetUi.notifications.at(-1)?.message).toContain("安全检查停止");
+});
+
+test("N-002 rejects late internal example, restore, and cleanup results", async () => {
+  const publishNewerBlockedGuidance = async (
+    runtime: Awaited<ReturnType<typeof createRuntime>>,
+    id: string,
+  ): Promise<void> => {
+    expect(
+      await emitCall(runtime, {
+        id,
+        name: "write",
+        arguments: { path: ".env", content: "secret" },
+      }),
+    ).toMatchObject({ block: true });
+  };
+
+  const example = await createRuntime({ bindUI: true });
+  const exampleUi = installApprovalUi(example, [
+    {
+      inputs: ["down", "down", "enter"],
+      onOpen: () => publishNewerBlockedGuidance(example, "newer-example"),
+    },
+  ]);
+  await example.session.prompt("/agentglass example");
+  expect(
+    await readFile(
+      join(example.cwd, "agentglass-example", "活动说明.txt"),
+      "utf8",
+    ),
+  ).toContain("活动名称");
+  const examplePanelText = exampleUi.widgets
+    .filter(
+      ({ key }) => key === "agentglass-action" || key === "agentglass-welcome",
+    )
+    .flatMap(({ content }) => content ?? [])
+    .join("\n");
+  expect(examplePanelText).not.toContain("安全示例已准备");
+  const exampleProcessUi = installStarterUi(example, []);
+  await example.session.prompt("/agentglass process");
+  expect(exampleProcessUi.notifications.at(-1)?.message).toContain(
+    "安全检查停止",
+  );
+
+  const restore = await createRuntime({ bindUI: true });
+  const restoreTarget = join(restore.cwd, "late-restore.txt");
+  await writeFile(restoreTarget, "before", "utf8");
+  const restoreCall = {
+    id: "late-restore-original",
+    name: "write",
+    arguments: { path: "late-restore.txt", content: "after" },
+  };
+  const restoreUi = installApprovalUi(restore, [
+    { inputs: ["down", "down", "enter"] },
+    {
+      inputs: ["down", "down", "enter"],
+      onOpen: () => publishNewerBlockedGuidance(restore, "newer-restore"),
+    },
+  ]);
+  expect(await emitCall(restore, restoreCall)).toBeUndefined();
+  await writeFile(restoreTarget, "after", "utf8");
+  await emitResult(restore, restoreCall);
+  await emitEnd(restore, restoreCall);
+  const restoreActionWidgetsBefore = restoreUi.widgets.filter(
+    ({ key }) => key === "agentglass-action",
+  );
+  const restoreActionTextBefore =
+    restoreActionWidgetsBefore.at(-1)?.content?.join("\n") ?? "";
+  await restore.session.prompt("/agentglass restore");
+  expect(await readFile(restoreTarget, "utf8")).toBe("before");
+  const restoreActionWidgetsAfter = restoreUi.widgets.filter(
+    ({ key }) => key === "agentglass-action",
+  );
+  expect(restoreActionWidgetsAfter).toHaveLength(
+    restoreActionWidgetsBefore.length,
+  );
+  expect(restoreActionWidgetsAfter.at(-1)?.content?.join("\n")).toBe(
+    restoreActionTextBefore,
+  );
+  const restoreActionText = restoreActionWidgetsAfter
+    .flatMap(({ content }) => content ?? [])
+    .join("\n");
+  expect(restoreActionText).toContain("late-restore.txt");
+  const restoreProcessUi = installStarterUi(restore, []);
+  await restore.session.prompt("/agentglass process");
+  expect(restoreProcessUi.notifications.at(-1)?.message).toContain(
+    "安全检查停止",
+  );
+
+  const cleanup = await createRuntime({ bindUI: true });
+  const cleanupTarget = join(cleanup.cwd, "late-cleanup.txt");
+  await writeFile(cleanupTarget, "before", "utf8");
+  const cleanupCall = {
+    id: "late-cleanup-original",
+    name: "write",
+    arguments: { path: "late-cleanup.txt", content: "after" },
+  };
+  const cleanupUi = installApprovalUi(cleanup, [
+    { inputs: ["down", "down", "enter"] },
+    {
+      inputs: ["down", "down", "enter"],
+      onOpen: () => publishNewerBlockedGuidance(cleanup, "newer-cleanup"),
+    },
+  ]);
+  expect(await emitCall(cleanup, cleanupCall)).toBeUndefined();
+  await writeFile(cleanupTarget, "after", "utf8");
+  await emitResult(cleanup, cleanupCall);
+  await emitEnd(cleanup, cleanupCall);
+  const cleanupWelcomeWidgetsBefore = cleanupUi.widgets.filter(
+    ({ key }) => key === "agentglass-welcome",
+  );
+  await cleanup.session.prompt("/agentglass cleanup");
+  expect(cleanupUi.notifications.at(-1)?.message).toContain("已删除");
+  expect(
+    cleanupUi.widgets.filter(({ key }) => key === "agentglass-welcome"),
+  ).toHaveLength(cleanupWelcomeWidgetsBefore.length);
+  const cleanupProcessUi = installStarterUi(cleanup, []);
+  await cleanup.session.prompt("/agentglass process");
+  expect(cleanupProcessUi.notifications.at(-1)?.message).toContain(
+    "安全检查停止",
+  );
 });
