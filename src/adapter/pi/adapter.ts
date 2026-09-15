@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
 import { lstat, mkdir, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
@@ -164,6 +163,7 @@ interface PendingVerification {
   targetPath: string;
   expected: ExpectedFilePostcondition;
   preImage: PreImageSnapshotEvidence;
+  relativeTarget?: string;
   guidanceOrder: number;
   inFlight: boolean;
 }
@@ -805,16 +805,16 @@ function starterPath(value: string): string | undefined {
 }
 
 function safeRelativeGuidanceTarget(
-  cwd: string,
-  targetPath: string,
+  input: HostExecutionFacts["input"],
 ): string | undefined {
   try {
-    // 文件信任链保存的是 canonical target，而宿主 cwd 可能仍是别名路径（例如
-    // junction/8.3 形式）。先同步解析 cwd，避免同一项目目标被 relative 误判为
-    // 工作区外；这里不把 canonical target 重新当作执行目标，starterPath 仍会拒绝
-    // 绝对路径、空段、控制符和脱敏后的变化。cwd 不存在或无法解析时安全放弃投影。
-    const canonicalCwd = realpathSync(cwd);
-    return starterPath(path.relative(canonicalCwd, path.resolve(targetPath)));
+    const redactedPath = (input.redactedInput as { path?: unknown }).path;
+    // 只保存分类阶段已脱敏、且 supportedPath/sensitive 已通过的原始相对路径投影；
+    // 它与同一 action 的 targetId/前像绑定，不再在结果回调里从 canonical 绝对路径
+    // 反推，避免 Windows 宿主 cwd、大小写或短路径表示差异把安全目标误判为未知。
+    return typeof redactedPath === "string"
+      ? starterPath(redactedPath)
+      : undefined;
   } catch {
     return undefined;
   }
@@ -1694,9 +1694,7 @@ export function registerPiAdapter(
     category: RecentGuidanceCategory,
     includeTarget: boolean,
   ): RecentGuidanceSeed => {
-    const relativeTarget = includeTarget
-      ? safeRelativeGuidanceTarget(pending.binding.cwd, pending.targetPath)
-      : undefined;
+    const relativeTarget = includeTarget ? pending.relativeTarget : undefined;
     const seed = {
       sessionId: pending.binding.sessionId,
       cwd: pending.binding.cwd,
@@ -3120,6 +3118,7 @@ export function registerPiAdapter(
         pendingTokens.delete(token);
         currentToken = undefined;
         if (consumed && verificationTarget && expected) {
+          const relativeTarget = safeRelativeGuidanceTarget(observed.input);
           pendingVerifications.set(toolCallId, {
             binding: token.binding,
             action: observed.action,
@@ -3127,6 +3126,7 @@ export function registerPiAdapter(
             targetPath: verificationTarget.targetPath,
             expected,
             preImage: observed.preImage,
+            ...(relativeTarget ? { relativeTarget } : {}),
             guidanceOrder,
             inFlight: false,
           });
@@ -3243,16 +3243,14 @@ export function registerPiAdapter(
             "superseded",
           ));
         if (replacementRecorded) {
-          const relativeTarget = safeRelativeGuidanceTarget(
-            pending.binding.cwd,
-            pending.targetPath,
-          );
           latestRecovery = Object.freeze({
             ...ready,
             sessionId: pending.binding.sessionId,
             cwd: pending.binding.cwd,
             targetLabel: pending.effect.targetLabel,
-            ...(relativeTarget ? { relativeTarget } : {}),
+            ...(pending.relativeTarget
+              ? { relativeTarget: pending.relativeTarget }
+              : {}),
           });
           recoveryAvailable = true;
         }

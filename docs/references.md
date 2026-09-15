@@ -2297,15 +2297,15 @@ N-002 §9.4 的代次相关要求经补丁和回归测试重新核验：内部�
 
 ## 51. N-002 CI 失败修复与目标投影回归（2026-09-15）
 
-本节记录用户提供的 Windows `npm run test:integration` 失败：`tests/integration/pi-adapter.test.ts` 的 N-002 核验目标 `a/same.txt` 与恢复冲突目标 `recover.txt` 草稿为空。本轮仍只修复 N-002，不启动 N-003/N-004，不重启 Pi Web，不改变已发布 `@hugo-ddt/agentglass@0.8.0` 的公开能力。
+本节记录用户提供的 Windows `npm run test:integration` 失败：`tests/integration/pi-adapter.test.ts` 的 N-002 核验目标 `a/same.txt` 与恢复冲突目标 `recover.txt` 草稿为空。本轮仍只修复 N-002，不启动 N-003/N-004，不重启 Pi Web，不改变已发布 `@hugo-ddt/agentglass@0.8.0` 的公开能力。其后该记录对应的 `b73e0f7` Action 仍报告两个场景的菜单调用为 0，故本节旧结论不再作为通过依据。
 
 ### 51.1 修复与回归
 
-- `src/adapter/pi/adapter.ts` 的共享 `safeRelativeGuidanceTarget` 现在先用 `realpathSync(cwd)` 解析宿主 cwd，再将已由文件信任链确认的 canonical target 做分段相对化。这样宿主以 junction/8.3 等别名路径提供 cwd 时，不会把同一项目内的目标误判为不可表示；cwd 无法解析仍不给定向目标。
+- 本节的初版修复曾让共享 `safeRelativeGuidanceTarget` 从 `realpathSync(cwd)` 重新计算路径；该方案已被后续候选替换，不能单独视为解决远端失败。
 - `tests/integration/pi-adapter.test.ts` 的两条报告场景补充断言：处理菜单确实打开且统一填入路径只调用一次；原有断言继续核对 `a/same.txt`/`recover.txt`、同名不同路径隔离、read 不覆盖、恢复冲突不自动恢复及不发送。
 - 未保存 raw input、批次、结果正文、snapshot 正文、编辑器原文或 token；未修改风险分类、批准绑定、自动重试/排队、恢复系统或菜单范围。
 
-工作树执行环境为 Windows、Node `v24.14.0`、npm `11.9.0`；HEAD 为 `e21953b8ecbb723ec5fda5b9d65824012b319343`。`package.json`/`package-lock.json`、peer 范围、版本、`.gitignore`、运行时依赖和外部发布状态未修改。用户提供的远端失败记录已核对；本轮没有重新触发或观察远端 CI，故远端 CI 仍为 `NOT_RUN`，不能把本地通过外推为远端 PASS。
+工作树执行环境为 Windows、Node `v24.14.0`、npm `11.9.0`；上一版记录对应的 HEAD 为 `e21953b8ecbb723ec5fda5b9d65824012b319343`。本节旧记录的远端失败已由用户后续反馈确认，不能把本地通过外推为远端 PASS。
 
 | 命令 | 退出码 | 实际结果 |
 |---|---:|---|
@@ -2323,4 +2323,16 @@ N-002 §9.4 的代次相关要求经补丁和回归测试重新核验：内部�
 
 N-002 §9.4 条目 1～6 在当前本地候选上保持 `PASS`：结构化最近项与目标事实、固定处理入口及严格失败边界、生命周期/迟到结果保护、N-001 输入框保护与不自动发送、完整本地工程/security/integration/e2e 门，以及 INV-002/003/005/007～010/012/013/016/019/020 映射均保持通过。`security-invariants.md` §16 的 N-002 映射补充引用本节；本修复不改变 risk/classification，corpus 仅作复核证据。真实人工 TUI、人工发送、参与者研究和 Human Validation 仍为 `NOT_RUN`；受控 Pi 自动化的“Pi 遵守请求”和“草稿填入”仍分开，不证明模型遵守未发送草稿。
 
-下一可分配任务仍为 N-003，但本次不自动开始。未执行 commit、push、tag、PR、发布或 Pi Web 操作。
+本节旧记录不再改变任务状态；后续候选与当前状态见 §52。未执行 commit、push、tag、PR、发布或 Pi Web 操作。
+
+## 52. N-002 目标投影修复候选（2026-09-16）
+
+用户反馈 `b73e0f7` 的 Windows Action 仍在 N-002 两条场景的 `dialogCalls=0` 处失败。上一版只规范化 `cwd` 与 canonical target 的绝对路径表示，仍可能在结果发布时因宿主路径表示差异丢失可选目标。本轮只继续修复 N-002，不启动 N-003/N-004，不重启 Pi Web，不改变 `@hugo-ddt/agentglass@0.8.0` 公开能力。
+
+修复将已通过分类、脱敏和支持性检查的相对路径投影写入内存 `PendingVerification.relativeTarget`，在 `tool_result`、缺失结果及恢复入口发布时复用；raw input、工具结果正文、文件正文、snapshot 正文、用户目标、编辑器内容和 token 均未保存。结果绑定失败仍不提供定向目标，安全门和可能已执行不重试边界不变。两条回归场景继续验证菜单打开一次、草稿填入一次、同名不同路径隔离、read 不覆盖、恢复冲突仅查看且不自动恢复/发送。
+
+当前 HEAD 为 `b73e0f74e7c8720eb67c912281b5920390253300`，工作树仅修改 `src/adapter/pi/adapter.ts`、`docs/development-plan.md`、`docs/security-invariants.md` 和本证据文件；package/lockfile、`.gitignore`、版本、依赖和外部状态未变。此前远端失败已核对，本轮未重新触发远端 Action，远端复测为 `NOT_RUN`。
+
+本地复测：`npm run typecheck`、`npm run lint`、`npm run build`、`npm run test:unit`、`npm run test:security`、`npm run test:corpus`、`npm run test:integration` 和 `npm run test:e2e` 均退出 `0`；Biome 检查 45 files，分别通过 unit 8 files/65 tests、security 9 files/65 tests、corpus 4 files/23 tests、integration 2 files/37 tests、e2e 1 file/15 tests。受影响的两条场景及完整 integration 已复测通过；本地此前通过的旧证据不替代远端复测。
+
+N-002 状态为 `IN_PROGRESS（本地修复候选；等待远端 Windows CI 复测）`，不是完成。适用映射仍为 `INV-002/003/005/007～010/012/013/016/019/020`；真实人工 TUI、人工发送、参与者研究和 Human Validation 仍 `NOT_RUN`。下一可分配任务不是 N-003，需先完成本轮 N-002 远端复测和用户评审；本次不自动开始后续任务。
