@@ -2533,6 +2533,8 @@ test("N-002 keeps one exact verification target, ignores reads and late results,
     { value: "填入：先查看这份文件" },
   ]);
   await runtime.session.prompt("/agentglass process");
+  expect(firstUi.dialogCalls).toBe(1);
+  expect(firstUi.setCalls).toBe(1);
   expect(firstUi.editorText).toContain("文件：a/same.txt");
   expect(firstUi.editorText).not.toContain("b/same.txt");
   expect(firstSend).not.toHaveBeenCalled();
@@ -2763,6 +2765,8 @@ test("N-002 offers viewing only for a safe recovery-conflict target and no targe
     { value: "填入：先查看这份文件" },
   ]);
   await recovery.session.prompt("/agentglass process");
+  expect(recoveryUi.dialogCalls).toBe(1);
+  expect(recoveryUi.setCalls).toBe(1);
   expect(recoveryUi.editorText).toContain("文件：recover.txt");
   expect(recoveryUi.editorText).not.toContain("恢复");
   expect(approvalUi.customCalls).toBe(1);

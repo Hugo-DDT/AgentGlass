@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { lstat, mkdir, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
@@ -808,11 +809,12 @@ function safeRelativeGuidanceTarget(
   targetPath: string,
 ): string | undefined {
   try {
-    // 只把已由文件信任链确认的真实目标投影成项目相对路径；relative 会拒绝
-    // 工作区外路径，starterPath 再拒绝绝对路径、空段、控制符和脱敏后的变化。
-    return starterPath(
-      path.relative(path.resolve(cwd), path.resolve(targetPath)),
-    );
+    // 文件信任链保存的是 canonical target，而宿主 cwd 可能仍是别名路径（例如
+    // junction/8.3 形式）。先同步解析 cwd，避免同一项目目标被 relative 误判为
+    // 工作区外；这里不把 canonical target 重新当作执行目标，starterPath 仍会拒绝
+    // 绝对路径、空段、控制符和脱敏后的变化。cwd 不存在或无法解析时安全放弃投影。
+    const canonicalCwd = realpathSync(cwd);
+    return starterPath(path.relative(canonicalCwd, path.resolve(targetPath)));
   } catch {
     return undefined;
   }

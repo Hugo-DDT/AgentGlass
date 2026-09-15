@@ -2294,3 +2294,33 @@ N-002 用户评审状态更新为 `COMPLETED`。security-invariants §16 的 N-0
 N-002 §9.4 的代次相关要求经补丁和回归测试重新核验：内部操作在开始时绑定代次，迟到示例/恢复/清理结果不能覆盖新结果；现有 session/cwd、read 不覆盖、无自动重试/发送、输入框保护和安全门保持通过。N-002 状态维持 `COMPLETED（本地工程门、用户评审及修复复测完成）`；适用 `INV-002/003/005/007～010/012/013/016/019/020` 映射维持 `PASS（本地工程与受控锁定 Pi 自动化证据）`，其中真人理解、宿主全局防护和 Human Validation 不在该 PASS 内。
 
 下一可分配任务仍为 N-003，但本次不自动开始。未执行 commit、push、tag、PR、发布或 Pi Web 操作。
+
+## 51. N-002 CI 失败修复与目标投影回归（2026-09-15）
+
+本节记录用户提供的 Windows `npm run test:integration` 失败：`tests/integration/pi-adapter.test.ts` 的 N-002 核验目标 `a/same.txt` 与恢复冲突目标 `recover.txt` 草稿为空。本轮仍只修复 N-002，不启动 N-003/N-004，不重启 Pi Web，不改变已发布 `@hugo-ddt/agentglass@0.8.0` 的公开能力。
+
+### 51.1 修复与回归
+
+- `src/adapter/pi/adapter.ts` 的共享 `safeRelativeGuidanceTarget` 现在先用 `realpathSync(cwd)` 解析宿主 cwd，再将已由文件信任链确认的 canonical target 做分段相对化。这样宿主以 junction/8.3 等别名路径提供 cwd 时，不会把同一项目内的目标误判为不可表示；cwd 无法解析仍不给定向目标。
+- `tests/integration/pi-adapter.test.ts` 的两条报告场景补充断言：处理菜单确实打开且统一填入路径只调用一次；原有断言继续核对 `a/same.txt`/`recover.txt`、同名不同路径隔离、read 不覆盖、恢复冲突不自动恢复及不发送。
+- 未保存 raw input、批次、结果正文、snapshot 正文、编辑器原文或 token；未修改风险分类、批准绑定、自动重试/排队、恢复系统或菜单范围。
+
+工作树执行环境为 Windows、Node `v24.14.0`、npm `11.9.0`；HEAD 为 `e21953b8ecbb723ec5fda5b9d65824012b319343`。`package.json`/`package-lock.json`、peer 范围、版本、`.gitignore`、运行时依赖和外部发布状态未修改。用户提供的远端失败记录已核对；本轮没有重新触发或观察远端 CI，故远端 CI 仍为 `NOT_RUN`，不能把本地通过外推为远端 PASS。
+
+| 命令 | 退出码 | 实际结果 |
+|---|---:|---|
+| `npm run typecheck` | 0 | `tsc --noEmit` 通过 |
+| `npm run lint` | 0 | Biome 检查 45 files，无 error |
+| `npm run build` | 0 | `tsc -p tsconfig.build.json` 通过 |
+| `npm run test:unit` | 0 | 9 files / 65 tests PASS |
+| `npm run test:security` | 0 | 8 files / 65 tests PASS |
+| `npm run test:corpus` | 0 | 4 files / 23 tests PASS；分类规则未变 |
+| `npm run test:integration` | 0 | 2 files / 37 tests PASS；报告的两条场景均 PASS |
+| `npm run test:e2e` | 0 | 1 file / 15 tests PASS |
+| `git diff --check` | 0 | 通过 |
+
+### 51.2 Done Definition、门与限制
+
+N-002 §9.4 条目 1～6 在当前本地候选上保持 `PASS`：结构化最近项与目标事实、固定处理入口及严格失败边界、生命周期/迟到结果保护、N-001 输入框保护与不自动发送、完整本地工程/security/integration/e2e 门，以及 INV-002/003/005/007～010/012/013/016/019/020 映射均保持通过。`security-invariants.md` §16 的 N-002 映射补充引用本节；本修复不改变 risk/classification，corpus 仅作复核证据。真实人工 TUI、人工发送、参与者研究和 Human Validation 仍为 `NOT_RUN`；受控 Pi 自动化的“Pi 遵守请求”和“草稿填入”仍分开，不证明模型遵守未发送草稿。
+
+下一可分配任务仍为 N-003，但本次不自动开始。未执行 commit、push、tag、PR、发布或 Pi Web 操作。
